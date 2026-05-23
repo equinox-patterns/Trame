@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:i="http://ns.adobe.com/AdobeIllustrator/10.0/" version="1.1" width="200mm" height="200mm" viewBox="0 0 756 756">
+  <g id="80-84" i:layer="yes">
+    <title>80-84</title>
+    <g id="Front">
+      <path d="M 10 10 L 100 10 C 120 10 130 30 130 50 L 130 100 L 10 100 Z" fill="none" stroke="#000" stroke-width="0.5"/>
+    </g>
+    <g id="Back">
+      <path d="M 150 10 L 250 10 L 250 150 L 150 150 Z" fill="none" stroke="#000" stroke-width="0.5"/>
+      <path d="M 160 20 L 240 20" fill="none" stroke="#00f" stroke-width="0.2"/>
+    </g>
+    <g id="Corps">
+      <g id="BodiceFront">
+        <path d="M 300 50 L 350 50 L 350 120 L 300 120 Z" fill="none" stroke="#000" stroke-width="0.5"/>
+      </g>
+      <g id="BodiceBack">
+        <path d="M 360 50 L 410 50 L 410 120 L 360 120 Z" fill="none" stroke="#000" stroke-width="0.5"/>
+      </g>
+    </g>
+  </g>
+  <g id="84-88" i:layer="yes">
+    <title>84-88</title>
+    <g id="Front">
+      <path d="M 12 12 L 105 12 C 125 12 135 32 135 52 L 135 105 L 12 105 Z" fill="none" stroke="#f00" stroke-width="0.5"/>
+    </g>
+    <g id="Back">
+      <path d="M 155 12 L 260 12 L 260 155 L 155 155 Z" fill="none" stroke="#f00" stroke-width="0.5"/>
+    </g>
+  </g>
+  <g id="Mise_en_page" i:layer="yes">
+    <title>Mise en page</title>
+    <g id="Front" i:layer="yes">
+      <g id="Front_grain">
+        <path d="M 20 20 L 20 80" fill="none" stroke="#000" stroke-width="0.2"/>
+      </g>
+    </g>
+  </g>
+</svg>
