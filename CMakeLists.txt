@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(Rabnest VERSION 0.1.0 LANGUAGES CXX)
+project(Rabnest VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,51 +15,58 @@ set(CLIPPER2_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CLIPPER2_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/clipper2/CPP EXCLUDE_FROM_ALL)
 
-# ── Rabnest sources ─────────────────────────────────────────────────────
-set(SOURCES
+# ── ZLIB ───────────────────────────────────────────────────────────────────
+find_package(ZLIB REQUIRED)
+
+# ── Include paths ─────────────────────────────────────────────────────────
+set(THIRD_PARTY_INCLUDES
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanosvg
+)
+
+# ── Rabnest CLI ───────────────────────────────────────────────────────────
+set(RABNEST_SOURCES
     src/main.cpp
-    src/io/RabnestReader.cpp
+    src/io/NestedSvgWriter.cpp
     src/io/SvgReader.cpp
     src/nesting/Bin.cpp
     src/nesting/Engine.cpp
     src/nesting/Footprint.cpp
-    src/nesting/SizeRestorer.cpp
-    src/pdf/PdfExporter.cpp
+    src/pdf/SvgToOcgPdf.cpp
 )
 
-set(HEADERS
+set(RABNEST_HEADERS
     src/model/Piece.h
     src/model/GradedSize.h
     src/model/Placement.h
-    src/model/TransformedPiece.h
-    src/io/RabnestReader.h
+    src/io/NestedSvgWriter.h
     src/io/SvgReader.h
     src/nesting/Bin.h
     src/nesting/Engine.h
     src/nesting/Footprint.h
-    src/nesting/SizeRestorer.h
-    src/pdf/PdfExporter.h
+    src/pdf/SvgToOcgPdf.h
+    src/pdf/PdfBuilder.h
 )
 
-add_executable(Rabnest ${SOURCES} ${HEADERS})
+add_executable(Rabnest ${RABNEST_SOURCES} ${RABNEST_HEADERS})
 
-target_include_directories(Rabnest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(Rabnest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${THIRD_PARTY_INCLUDES}
+)
 
 target_link_libraries(Rabnest PRIVATE
     Qt6::Widgets
     Qt6::Xml
     Qt6::Svg
+    Qt6::PrintSupport
     Clipper2
+    ZLIB::ZLIB
 )
 
-# ── Test utilities ───────────────────────────────────────────────────────
-find_package(ZLIB REQUIRED)
-
-add_executable(svg2pdf tests/svg2pdf.cpp)
-target_link_libraries(svg2pdf PRIVATE Qt6::Widgets Qt6::Svg Qt6::SvgWidgets Qt6::Xml Qt6::PrintSupport)
+# ── Tools ─────────────────────────────────────────────────────────────────
 
 add_executable(svg2ocgpdf
-    tests/svg2ocgpdf.cpp
+    tools/svg2ocgpdf.cpp
     src/pdf/SvgToOcgPdf.cpp
 )
 target_include_directories(svg2ocgpdf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -70,3 +77,8 @@ target_link_libraries(svg2ocgpdf PRIVATE
     Qt6::PrintSupport
     ZLIB::ZLIB
 )
+
+# ── Test utilities ─────────────────────────────────────────────────────────
+
+add_executable(svg2pdf tests/svg2pdf.cpp)
+target_link_libraries(svg2pdf PRIVATE Qt6::Widgets Qt6::Svg Qt6::SvgWidgets Qt6::Xml Qt6::PrintSupport)

@@ -22,6 +22,82 @@
 
 #include "GradedSize.h"
 
+// ── Path visual style ───────────────────────────────────────────────────────
+
+struct PathStyle
+{
+    QString stroke = QStringLiteral("#000000");
+    double  strokeWidth = 1.0;
+    QString strokeDasharray;   // SVG dasharray syntax, empty = solid
+    QString fill = QStringLiteral("none");
+};
+
+// ── Mise-en-page path (grainline) ────────────────────────────────────────────
+
+struct MepPath
+{
+    Clipper2Lib::Path64 polyline;
+    PathStyle           style;
+};
+
+// ── Label type ───────────────────────────────────────────────────────────────
+
+enum class LabelType { Text, Logo };
+
+// ── Mise-en-page label (deprecated — for SVG import only) ────────────────────
+
+struct MepLabel
+{
+    enum Type { Text, RasterBlock, SvgFragment };
+    Type    type = Text;
+    QString pieceName;
+    QString text;
+    QString fontFamily;
+    double  fontSize = 12;
+    QString fontWeight = QStringLiteral("normal");
+    QString fill = QStringLiteral("#000000");
+    QString align  = QStringLiteral("left");
+    double  x = 0, y = 0;
+    double  rotation = 0;
+    double  scaleX = 1, scaleY = 1;
+    QString transform;  // raw SVG transform attribute
+    QString svgContent; // serialised SVG fragment (for RasterBlock logos)
+    int     blockId = 0;
+    double  origX = 0, origY = 0;  // original position before nesting transform
+    QString elementId;              // SVG element ID for QSvgRenderer lookup
+};
+
+// ── Flat label (native .rabnest label) ───────────────────────────────────────
+
+struct FlatLabel
+{
+    LabelType type = LabelType::Text;
+    double x = 0, y = 0;        // position relative to piece origin (pixels 96 DPI)
+    double rotation = 0;         // degrees
+    int    blockId = 0;          // label block identifier
+    double pieceMx = 0, pieceMy = 0; // piece origin in layout coords (for nesting transform)
+
+    // Text
+    QString text;
+    QString fontFamily;
+    double  fontSize = 12;
+    QString fontWeight;          // "normal" | "bold"
+    QString fill;                // hex color
+    QString align;               // "left" | "center" | "right"
+
+    // Logo (paths pre-rendered by Valentina)
+    struct LogoPath {
+        QString d;
+        QString fill;
+        QString stroke;
+        double  strokeWidth = 0;
+        QString strokeDasharray;
+        QString fillRule;        // "nonzero" | "evenodd"
+    };
+    QVector<LogoPath> logoPaths;
+    double logoScale = 1.0;     // scale from native SVG coords to label pixels
+};
+
 // ── Piece label data ──────────────────────────────────────────────────────
 
 struct PieceLabelData
@@ -191,6 +267,9 @@ struct Piece
     QVector<SAMarginGroup> saMarginGroups;
 
     QVector<GradedSize> sizes;             // graded contour per size
+
+    // Visual style extracted from SVG / .rabnest
+    PathStyle style;
 
     // For SVG import: which group this piece belongs to (empty = standalone)
     QString groupName;

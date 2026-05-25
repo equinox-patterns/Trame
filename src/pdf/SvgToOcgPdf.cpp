@@ -137,10 +137,12 @@ static Affine2D parseSvgTransform(const QString &tx)
 
     if (funcs.isEmpty()) return result;
 
-    // Compose right-to-left: result = M_current × result
-    for (const auto &fn : funcs) {
+    // Compose right-to-left: SVG transform="A B C" applies C first, then B, then A.
+    // The matrix is: A × B × C. Iterate in reverse so the rightmost function
+    // is composed first.
+    for (int i = funcs.size() - 1; i >= 0; --i) {
         Affine2D m;
-        if (parseOneTransform(fn, m)) {
+        if (parseOneTransform(funcs[i], m)) {
             // Pre-multiply: result = m × result
             result = Affine2D{
                 m.a * result.a + m.c * result.b,
@@ -535,12 +537,12 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
                 // Compose: currentTx (parent chain) then selfTx
                 // (row-vector: p' = p × currentTx × selfTx)
                 textTx = Affine2D{
-                    selfTx.a * currentTx.a + selfTx.c * currentTx.b,
-                    selfTx.b * currentTx.a + selfTx.d * currentTx.b,
-                    selfTx.a * currentTx.c + selfTx.c * currentTx.d,
-                    selfTx.b * currentTx.c + selfTx.d * currentTx.d,
-                    selfTx.a * currentTx.e + selfTx.c * currentTx.f + selfTx.e,
-                    selfTx.b * currentTx.e + selfTx.d * currentTx.f + selfTx.f
+                    currentTx.a * selfTx.a + currentTx.c * selfTx.b,
+                    currentTx.b * selfTx.a + currentTx.d * selfTx.b,
+                    currentTx.a * selfTx.c + currentTx.c * selfTx.d,
+                    currentTx.b * selfTx.c + currentTx.d * selfTx.d,
+                    currentTx.a * selfTx.e + currentTx.c * selfTx.f + currentTx.e,
+                    currentTx.b * selfTx.e + currentTx.d * selfTx.f + currentTx.f
                 };
             }
 

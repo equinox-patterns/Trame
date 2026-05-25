@@ -32,7 +32,7 @@
 #include <QTextStream>
 
 #define NANOSVG_IMPLEMENTATION
-#include "io/nanosvg.h"
+#include "nanosvg.h"
 
 #include <cmath>
 #include <cstdint>
