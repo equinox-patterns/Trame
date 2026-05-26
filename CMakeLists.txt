@@ -18,11 +18,6 @@ add_subdirectory(third_party/clipper2/CPP EXCLUDE_FROM_ALL)
 # ── ZLIB ───────────────────────────────────────────────────────────────────
 find_package(ZLIB REQUIRED)
 
-# ── Include paths ─────────────────────────────────────────────────────────
-set(THIRD_PARTY_INCLUDES
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanosvg
-)
-
 # ── Rabnest CLI ───────────────────────────────────────────────────────────
 set(RABNEST_SOURCES
     src/main.cpp
@@ -51,7 +46,6 @@ add_executable(Rabnest ${RABNEST_SOURCES} ${RABNEST_HEADERS})
 
 target_include_directories(Rabnest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_INCLUDES}
 )
 
 target_link_libraries(Rabnest PRIVATE
