@@ -34,8 +34,8 @@ static int64_t computeInfY(const std::vector<std::vector<Clipper2Lib::Path64>> &
     for (const auto &bank : rotBank) {
         if (bank.empty()) continue;
         // Compute bbox inline to avoid dependency order issues
-        int64_t yMin = std::numeric_limits<int64_t>::max();
-        int64_t yMax = std::numeric_limits<int64_t>::min();
+        int64_t yMin = (std::numeric_limits<int64_t>::max)();
+        int64_t yMax = (std::numeric_limits<int64_t>::min)();
         for (const auto &p : bank[0]) {
             if (p.y < yMin) yMin = p.y;
             if (p.y > yMax) yMax = p.y;
@@ -59,10 +59,10 @@ struct BBox {
 
 BBox bboxFromPath(const Clipper2Lib::Path64 &path)
 {
-    BBox b{std::numeric_limits<int64_t>::max(),
-           std::numeric_limits<int64_t>::max(),
-           std::numeric_limits<int64_t>::min(),
-           std::numeric_limits<int64_t>::min()};
+    BBox b = {(std::numeric_limits<int64_t>::max)(),
+              (std::numeric_limits<int64_t>::max)(),
+              (std::numeric_limits<int64_t>::min)(),
+              (std::numeric_limits<int64_t>::min)()};
     for (const auto &p : path) {
         if (p.x < b.xMin) b.xMin = p.x;
         if (p.y < b.yMin) b.yMin = p.y;
@@ -110,7 +110,7 @@ Clipper2Lib::Paths64 translatePaths(const Clipper2Lib::Paths64 &paths,
 /// Ignores empty sub-paths. Returns {0, INT64_MAX} if the region is empty.
 Clipper2Lib::Point64 findBottomLeft(const Clipper2Lib::Paths64 &paths)
 {
-    Clipper2Lib::Point64 best{int64_t(0), std::numeric_limits<int64_t>::max()};
+    Clipper2Lib::Point64 best = {int64_t(0), (std::numeric_limits<int64_t>::max)()};
     for (const auto &path : paths) {
         if (path.empty())
             continue;
@@ -232,6 +232,7 @@ double Engine::placeSequential(const Bin &bin,
                                int64_t infY) const
 {
     const int64_t binW    = static_cast<int64_t>(bin.widthMm() * kScale);
+    const int64_t margin  = static_cast<int64_t>(bin.marginMm() * kScale);
     const int64_t halfGap = static_cast<int64_t>(m_config.gap * kScale / 2.0);
 
     out.clear();
@@ -256,9 +257,9 @@ double Engine::placeSequential(const Bin &bin,
         const Clipper2Lib::Path64 &B    = rotBank[pieceIdx][rIdx];
         const BBox bboxB = bboxFromPath(B);
 
-        int64_t ifpX0 = -bboxB.xMin;
-        int64_t ifpX1 = binW - bboxB.xMax;
-        int64_t ifpY0 = -bboxB.yMin;
+        int64_t ifpX0 = margin - bboxB.xMin;
+        int64_t ifpX1 = binW - margin - bboxB.xMax;
+        int64_t ifpY0 = margin - bboxB.yMin;
 
         if (ifpX1 <= ifpX0) {
             out[pieceIdx].pieceIndex = pieceIdx;

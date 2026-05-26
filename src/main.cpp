@@ -106,10 +106,10 @@ int main(int argc, char *argv[])
     // ── 3. Nesting ──────────────────────────────────────────────────────────
     constexpr double kMmToPx = 96.0 / 25.4;
     const double binWidthPx = binWidthMm * kMmToPx;
-    Bin bin(binWidthPx);
+    Bin bin(binWidthPx, 5.0 * kMmToPx); // 5 mm margin
 
     qWarning() << "";
-    qWarning() << "Bin:" << binWidthMm << "mm x unlimited (strip)";
+    qWarning() << "Bin:" << binWidthMm << "mm x unlimited (strip), margin: 5 mm";
 
     std::vector<Placement> placements;
     const bool noNesting = parser.isSet(QStringLiteral("no-nesting"));
@@ -136,8 +136,8 @@ int main(int argc, char *argv[])
     double usedHeightMm = 0;
     for (size_t i = 0; i < placements.size() && i < fp.polygons.size(); ++i) {
         // Normalize polygon to origin (same as Engine::place)
-        int64_t xMin = std::numeric_limits<int64_t>::max();
-        int64_t yMin = std::numeric_limits<int64_t>::max();
+        int64_t xMin = (std::numeric_limits<int64_t>::max)();
+        int64_t yMin = (std::numeric_limits<int64_t>::max)();
         for (const auto &pt : fp.polygons[i]) {
             if (pt.x < xMin) xMin = pt.x;
             if (pt.y < yMin) yMin = pt.y;
@@ -165,7 +165,7 @@ int main(int argc, char *argv[])
             rotated = std::move(local);
         }
 
-        int64_t ryMax = std::numeric_limits<int64_t>::min();
+        int64_t ryMax = (std::numeric_limits<int64_t>::min)();
         for (const auto &pt : rotated) {
             if (pt.y > ryMax) ryMax = pt.y;
         }
@@ -174,6 +174,7 @@ int main(int argc, char *argv[])
         if (bottom > usedHeightMm)
             usedHeightMm = bottom;
     }
+    usedHeightMm += bin.marginMm(); // bottom margin
     usedHeightMm *= 25.4 / 96.0;  // SVG px → mm
     if (usedHeightMm < 100) usedHeightMm = 100; // minimum page height
 

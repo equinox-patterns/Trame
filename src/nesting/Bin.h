@@ -26,14 +26,18 @@
 class Bin
 {
 public:
-    /// Construct a strip bin with the given width in millimetres.
-    explicit Bin(double widthMm) noexcept;
+    /// Construct a strip bin with the given width and margin in millimetres.
+    explicit Bin(double widthMm, double marginMm = 5.0) noexcept;
 
-    /// Strip width in millimetres.
+    /// Strip width in millimetres (total physical width, margins included).
     double widthMm() const noexcept { return m_widthMm; }
+
+    /// Margin inside the bin edges where pieces cannot be placed, in millimetres.
+    double marginMm() const noexcept { return m_marginMm; }
 
 private:
     double m_widthMm;
+    double m_marginMm;
 };
 
 #endif // BIN_H

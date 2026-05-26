@@ -14,7 +14,12 @@
 
 #include "Bin.h"
 
-Bin::Bin(double widthMm) noexcept
+#include <cassert>
+
+Bin::Bin(double widthMm, double marginMm) noexcept
     : m_widthMm(widthMm)
+    , m_marginMm(marginMm)
 {
+    assert(widthMm > 0.0 && "Bin width must be positive");
+    assert(marginMm >= 0.0 && "Bin margin must be non-negative");
 }
