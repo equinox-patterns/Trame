@@ -81,7 +81,9 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
                              const std::vector<Placement> &placements,
                              const Footprint::Result    &fp,
                              double                     binWidthMm,
-                             double                     usedHeightMm)
+                             double                     usedHeightMm,
+                             double                     obstacleWidthMm,
+                             double                     obstacleHeightMm)
 {
     // ── 1. Parse input SVG ──────────────────────────────────────────────────
     QFile inFile(inputSvg);
@@ -249,7 +251,5 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
     doc.save(ts, 0);
     outFile.close();
 
-    qWarning() << "Nested SVG written to" << outputSvg;
-    qWarning() << "  Page:" << binWidthMm << "x" << usedHeightMm << "mm";
     return true;
 }

@@ -249,7 +249,37 @@ double Engine::placeSequential(const Bin &bin,
     std::vector<Placed> placed;
     placed.reserve(order.size());
 
-    int64_t maxYScaled = 0;
+    // Obstacle (e.g. A4 zone at top-left) — treated as a pre-placed piece
+    // whose NFP is subtracted from the IFP of every new piece.
+    const bool hasObstacle = bin.obstacleWidthMm() > 0.0 && bin.obstacleHeightMm() > 0.0;
+    Clipper2Lib::Path64 obsPath;       // inflated obstacle, local coords
+    Clipper2Lib::Path64 obsNegOrig;    // negated (uninflated) for NFP
+    BBox obsBBoxLocal;
+    int64_t obsPx = 0, obsPy = 0;
+    if (hasObstacle) {
+        const int64_t obsW = static_cast<int64_t>(bin.obstacleWidthMm() * kScale);
+        const int64_t obsH = static_cast<int64_t>(bin.obstacleHeightMm() * kScale);
+        Clipper2Lib::Path64 raw = makeRect(margin, margin, margin + obsW, margin + obsH);
+        // Normalize
+        const BBox rawBB = bboxFromPath(raw);
+        Clipper2Lib::Path64 local = translatePath(raw, -rawBB.xMin, -rawBB.yMin);
+        obsBBoxLocal = bboxFromPath(local);
+        obsPx = margin;
+        obsPy = margin;
+        // Inflate for gap (same as placed pieces)
+        if (halfGap > 0) {
+            auto inflated = Clipper2Lib::InflatePaths({local}, halfGap,
+                Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
+            obsPath = (!inflated.empty()) ? inflated[0] : local;
+        } else {
+            obsPath = local;
+        }
+        obsNegOrig = negatePath(local); // NFP = MinkowskiSum(obsPath, negB) but use uninflated origin
+    }
+
+    int64_t maxYScaled = hasObstacle
+        ? (margin + static_cast<int64_t>(bin.obstacleHeightMm() * kScale))
+        : 0;
 
     for (int orderIdx = 0; orderIdx < static_cast<int>(order.size()); ++orderIdx) {
         const int pieceIdx = order[orderIdx];
@@ -267,7 +297,8 @@ double Engine::placeSequential(const Bin &bin,
             return kBadHeight;
         }
 
-        // Build feasible region = IFP rectangle minus NFPs of placed pieces.
+        // Build feasible region = IFP rectangle minus NFPs of placed pieces +
+        // obstacle.
         Clipper2Lib::Paths64 feasible;
         {
             Clipper2Lib::Clipper64 clipper;
@@ -314,6 +345,23 @@ double Engine::placeSequential(const Bin &bin,
                 if (!nfp->empty()) {
                     const auto translated = translatePaths(*nfp, p.px, p.py);
                     clipper.AddClip(translated);
+                }
+            }
+
+            // Subtract obstacle NFP (like a pre-placed piece at margin,margin).
+            if (hasObstacle) {
+                const int64_t obsNfpMaxX = obsPx + obsBBoxLocal.xMax - bboxB.xMin;
+                const int64_t obsNfpMinX = obsPx + obsBBoxLocal.xMin - bboxB.xMax;
+                const int64_t obsNfpMaxY = obsPy + obsBBoxLocal.yMax - bboxB.yMin;
+                if (!(obsNfpMaxY <= ifpY0 || obsNfpMaxX <= ifpX0 || obsNfpMinX >= ifpX1)) {
+                    Clipper2Lib::Path64 negB = negatePath(B);
+                    Clipper2Lib::Paths64 nfpObs =
+                        Clipper2Lib::MinkowskiSum(obsPath, negB, true);
+                    for (auto &np : nfpObs) {
+                        if (Clipper2Lib::Area(np) < 0)
+                            std::reverse(np.begin(), np.end());
+                    }
+                    clipper.AddClip(translatePaths(nfpObs, obsPx, obsPy));
                 }
             }
 

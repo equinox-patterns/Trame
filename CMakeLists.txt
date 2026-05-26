@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_AUTOMOC ON)
 
 # ── Qt 6 ───────────────────────────────────────────────────────────────────
 find_package(Qt6 REQUIRED COMPONENTS Widgets Xml Svg SvgWidgets PrintSupport)
@@ -27,6 +28,7 @@ set(RABNEST_SOURCES
     src/nesting/Engine.cpp
     src/nesting/Footprint.cpp
     src/pdf/SvgToOcgPdf.cpp
+    src/ui/NestingDialog.cpp
 )
 
 set(RABNEST_HEADERS
@@ -40,6 +42,7 @@ set(RABNEST_HEADERS
     src/nesting/Footprint.h
     src/pdf/SvgToOcgPdf.h
     src/pdf/PdfBuilder.h
+    src/ui/NestingDialog.h
 )
 
 add_executable(Rabnest ${RABNEST_SOURCES} ${RABNEST_HEADERS})

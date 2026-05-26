@@ -40,13 +40,17 @@ public:
     /// @param fp         Footprint result (polygons for bbox, keys for identity)
     /// @param binWidthMm Bin width in millimetres
     /// @param usedHeightMm Total used height in millimetres
+    /// @param obstacleWidthMm Optional obstacle rectangle width (0 = none)
+    /// @param obstacleHeightMm Optional obstacle rectangle height (0 = none)
     /// @return true on success
     bool write(const QString              &inputSvg,
                const QString              &outputSvg,
                const std::vector<Placement> &placements,
                const Footprint::Result    &fp,
                double                     binWidthMm,
-               double                     usedHeightMm);
+               double                     usedHeightMm,
+               double                     obstacleWidthMm  = 0.0,
+               double                     obstacleHeightMm = 0.0);
 
 private:
     struct PieceTransform
