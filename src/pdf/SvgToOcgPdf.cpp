@@ -681,7 +681,9 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     for (const auto *sz : sizeLayers) {
         QByteArray body;
         QTextStream ts(&body);
-        ts << "<< /Type /OCG /Name (" << sz->name << ") >>\n";
+        QString displayName = sz->name;
+        displayName.replace(QLatin1Char('_'), QLatin1Char(' '));
+        ts << "<< /Type /OCG /Name (" << displayName << ") >>\n";
         ts.flush();
         const int objNum = pdf.alloc();
         ocgObjs.append(objNum);
@@ -693,7 +695,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     if (mepLayer) {
         mepOcgObj = pdf.alloc();
         pdf.add(mepOcgObj,
-                QStringLiteral("<< /Type /OCG /Name (Mise_en_page) >>\n").toUtf8());
+                QStringLiteral("<< /Type /OCG /Name (Mise en page) >>\n").toUtf8());
     }
 
     // ExtGState object referenced by QPdfWriter content streams as /GSa gs
