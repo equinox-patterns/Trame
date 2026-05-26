@@ -13,6 +13,7 @@
  *************************************************************************/
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <QApplication>
@@ -131,17 +132,45 @@ int main(int argc, char *argv[])
         qWarning() << "Placements:" << placements.size();
     }
 
-    // ── 4. Compute used height ─────────────────────────────────────────────
+    // ── 4. Compute used height (accounting for rotation) ───────────────────
     double usedHeightMm = 0;
     for (size_t i = 0; i < placements.size() && i < fp.polygons.size(); ++i) {
+        // Normalize polygon to origin (same as Engine::place)
+        int64_t xMin = std::numeric_limits<int64_t>::max();
         int64_t yMin = std::numeric_limits<int64_t>::max();
-        int64_t yMax = std::numeric_limits<int64_t>::min();
         for (const auto &pt : fp.polygons[i]) {
+            if (pt.x < xMin) xMin = pt.x;
             if (pt.y < yMin) yMin = pt.y;
-            if (pt.y > yMax) yMax = pt.y;
         }
-        const double height = (yMax - yMin) / 1e6;           // Clipper2 → SVG px
-        const double bottom = placements[i].y + height;       // SVG px
+
+        Clipper2Lib::Path64 local;
+        local.reserve(fp.polygons[i].size());
+        for (const auto &pt : fp.polygons[i])
+            local.push_back({pt.x - xMin, pt.y - yMin});
+
+        // Rotate to match placement
+        Clipper2Lib::Path64 rotated;
+        if (placements[i].rotation != 0.0) {
+            const double rad = placements[i].rotation * M_PI / 180.0;
+            const double c   = std::cos(rad);
+            const double s   = std::sin(rad);
+            rotated.reserve(local.size());
+            for (const auto &pt : local) {
+                rotated.push_back({
+                    static_cast<int64_t>(std::round(pt.x * c - pt.y * s)),
+                    static_cast<int64_t>(std::round(pt.x * s + pt.y * c))
+                });
+            }
+        } else {
+            rotated = std::move(local);
+        }
+
+        int64_t ryMax = std::numeric_limits<int64_t>::min();
+        for (const auto &pt : rotated) {
+            if (pt.y > ryMax) ryMax = pt.y;
+        }
+
+        const double bottom = placements[i].y + ryMax / 1e6; // SVG px
         if (bottom > usedHeightMm)
             usedHeightMm = bottom;
     }
