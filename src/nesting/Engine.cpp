@@ -285,20 +285,20 @@ double Engine::placeSequential(const Bin &bin,
                 if (it != nfpCache.end()) {
                     nfp = &it->second;
                 } else {
-                    // Use convex hull for fast MinkowskiSum (conservative NFP).
-                    const Clipper2Lib::Path64 &Aconvex = convexRotBank[p.pieceIdx][p.rotIdx];
+                    // Use full polygon for accurate NFP (concavities can be exploited).
+                    const Clipper2Lib::Path64 &Areal = rotBank[p.pieceIdx][p.rotIdx];
                     Clipper2Lib::Paths64 Ainflated;
                     if (halfGap > 0) {
-                        Ainflated = Clipper2Lib::InflatePaths({Aconvex}, halfGap,
+                        Ainflated = Clipper2Lib::InflatePaths({Areal}, halfGap,
                             Clipper2Lib::JoinType::Miter,
                             Clipper2Lib::EndType::Polygon);
                     }
                     const Clipper2Lib::Path64 &Aref = halfGap > 0 && !Ainflated.empty()
-                        ? Ainflated[0] : Aconvex;
-                    Clipper2Lib::Path64 negBconvex = negatePath(
-                        convexRotBank[pieceIdx][rIdx]);
+                        ? Ainflated[0] : Areal;
+                    Clipper2Lib::Path64 negBreal = negatePath(
+                        rotBank[pieceIdx][rIdx]);
                     Clipper2Lib::Paths64 nfpResult =
-                        Clipper2Lib::MinkowskiSum(Aref, negBconvex, true);
+                        Clipper2Lib::MinkowskiSum(Aref, negBreal, true);
 
                     // Ensure NFP paths are CCW (Clipper2 Difference requires CCW clips).
                     for (auto &np : nfpResult) {

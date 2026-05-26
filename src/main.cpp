@@ -118,7 +118,7 @@ int main(int argc, char *argv[])
             placements.push_back({0, 0.0, 0.0});
     } else {
         Engine::Config cfg;
-        cfg.gap = 2.0 * kMmToPx;
+        cfg.gap = 5.0 * kMmToPx;
         Engine engine(cfg);
 
         qWarning() << "Nesting...";

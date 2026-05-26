@@ -36,13 +36,13 @@ class Engine
 public:
     struct Config
     {
-        double gap           = 2.0;    ///< Gap between pieces, mm
+        double gap           = 5.0;    ///< Gap between pieces, mm
         double rotationStep  = 2.0;    ///< Rotation precision, degrees
         bool   freeRotation  = true;   ///< If false, pieces keep their input rotation
-        int    maxIterations = 45;     ///< Simulated annealing iterations
-        int    plateauLimit  = 20;     ///< Stop if no improvement for this many iterations
+        int    maxIterations = 1000;   ///< Simulated annealing iterations
+        int    plateauLimit  = 200;    ///< Stop if no improvement for this many iterations
         double initialTemp   = 100.0;  ///< Initial temperature
-        double coolingRate   = 0.95;   ///< Temperature multiplier per iteration
+        double coolingRate   = 0.98;   ///< Temperature multiplier per iteration
     };
 
     // ── NFP cache ──────────────────────────────────────────────────────────
