@@ -139,6 +139,12 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
     };
 
     // ── 4. Walk size layers and apply transforms to piece groups ────────────
+    //
+    // Also build a piece-to-group mapping for the MEP layer (step 5).
+    // Grouped pieces have their MEP wrappers keyed by individual piece name,
+    // but xforms uses the group name. This mapping bridges the two.
+    QHash<QString, QString> pieceToGroup;
+
     const QDomNodeList topChildren = svgRoot.childNodes();
     for (int i = 0; i < topChildren.size(); ++i) {
         QDomElement layerEl = topChildren.at(i).toElement();
@@ -172,6 +178,9 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
                 for (int k = 0; k < inner.size(); ++k) {
                     QDomElement pieceEl = inner.at(k).toElement();
                     if (pieceEl.isNull() || pieceEl.tagName() != QStringLiteral("g")) continue;
+
+                    // Save mapping for MEP layer lookup
+                    pieceToGroup.insert(pieceEl.attribute(QStringLiteral("id")), groupName);
 
                     if (itGroup != xforms.end()) {
                         applyTransform(pieceEl, itGroup.value());
@@ -214,6 +223,13 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
 
             const QString pieceName = el.attribute(QStringLiteral("id"));
             auto it = xforms.find(pieceName);
+            if (it == xforms.end()) {
+                // Try piece→group mapping (for grouped pieces whose MEP
+                // wrapper is keyed by individual piece name, not group name)
+                const QString group = pieceToGroup.value(pieceName);
+                if (!group.isEmpty())
+                    it = xforms.find(group);
+            }
             if (it == xforms.end()) {
                 for (const auto &k : fp.keys) {
                     if (k.endsWith(QStringLiteral("::") + pieceName)) {
