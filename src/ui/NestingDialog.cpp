@@ -4,7 +4,8 @@
  **  @author Sophie Denys <contact@sophiedenys.com>
  **  @date   26/05/2026
  **
- **  @brief  Temporary modal UI — import SVG, choose bin, run nesting, export SVG.
+ **  @brief  Batch modal UI — import multiple SVGs, choose bins, run nesting,
+ **          export all SVGs automatically.
  **
  **  @copyright
  **  Copyright (C) 2026 Sophie Denys <contact@sophiedenys.com>
@@ -14,12 +15,12 @@
 
 #include "ui/NestingDialog.h"
 
-#include <QApplication>
+#include <QCloseEvent>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QFutureWatcher>
 #include <QGroupBox>
+
 #include <QSettings>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrent>
@@ -129,7 +130,6 @@ static NestingResult runPipeline(const QString &svgPath, double binWidthMm)
     r.usedHeightMm += bin.marginMm();
     r.usedHeightMm *= 25.4 / 96.0;
     if (r.usedHeightMm < 100) r.usedHeightMm = 100;
-    // Ensure height accounts for obstacle at top
     const double obstacleBottomMm = (bin.marginMm() + bin.obstacleHeightMm()) * 25.4 / 96.0;
     if (r.usedHeightMm < obstacleBottomMm) r.usedHeightMm = obstacleBottomMm;
 
@@ -137,26 +137,92 @@ static NestingResult runPipeline(const QString &svgPath, double binWidthMm)
     return r;
 }
 
+// ── Batch job descriptor ──────────────────────────────────────────────────
+
+struct BatchJob {
+    QString svgPath;
+    double  binWidthMm;
+    QString suffix;
+};
+
+// ── Batch worker (runs in QtConcurrent::run) ──────────────────────────────
+
+struct BatchProgress {
+    std::atomic<int> *jobIndex  = nullptr;
+    QString          *jobStatus = nullptr;
+    QMutex           *mutex     = nullptr;
+};
+
+static void runBatch(const QVector<BatchJob> &jobs, const QString &outputDir,
+                     BatchProgress prog, QStringList &outErrors)
+{
+    for (int i = 0; i < jobs.size(); ++i) {
+        const BatchJob &job = jobs[i];
+        const QFileInfo fi(job.svgPath);
+        const QString label = QStringLiteral("%1 → %2 mm").arg(fi.fileName()).arg(job.binWidthMm, 0, 'f', 0);
+
+        NestingResult r = runPipeline(job.svgPath, job.binWidthMm);
+
+        QString statusLine;
+        if (!r.success) {
+            statusLine = QStringLiteral("[%1/%2] %3 — FAILED: %4")
+                             .arg(i + 1).arg(jobs.size()).arg(label, r.error);
+            outErrors.append(statusLine);
+        } else {
+            const QString outputPath = outputDir + QLatin1Char('/')
+                + fi.completeBaseName() + job.suffix + QStringLiteral(".svg");
+
+            NestedSvgWriter writer;
+            if (!writer.write(job.svgPath, outputPath, r.placements, r.fp,
+                             job.binWidthMm, r.usedHeightMm)) {
+                statusLine = QStringLiteral("[%1/%2] %3 — FAILED: could not write SVG")
+                                 .arg(i + 1).arg(jobs.size()).arg(label);
+                outErrors.append(statusLine);
+            } else {
+                statusLine = QStringLiteral("[%1/%2] %3 — Done in %4 s, height %5 mm → %6")
+                                 .arg(i + 1).arg(jobs.size()).arg(label)
+                                 .arg(r.elapsed, 0, 'f', 1)
+                                 .arg(r.usedHeightMm, 0, 'f', 0)
+                                 .arg(outputPath);
+            }
+        }
+
+        // Publish progress
+        prog.jobIndex->store(i + 1, std::memory_order_relaxed);
+        {
+            QMutexLocker lock(prog.mutex);
+            *prog.jobStatus = statusLine;
+        }
+    }
+}
+
 // ── NestingDialog ───────────────────────────────────────────────────────────
 
 NestingDialog::NestingDialog(QWidget *parent)
     : QDialog(parent)
 {
-    setWindowTitle(QStringLiteral("Rabnest — Nesting"));
-    setMinimumWidth(520);
+    setWindowTitle(QStringLiteral("Rabnest — Batch Nesting"));
+    setMinimumWidth(560);
 
     QSettings settings;
     auto *mainLayout = new QVBoxLayout(this);
 
-    // ── Input file ──────────────────────────────────────────────────────────
-    auto *fileGroup = new QGroupBox(QStringLiteral("Input"), this);
-    auto *fileLayout = new QHBoxLayout(fileGroup);
-    m_inputFile = new QLineEdit(this);
-    m_inputFile->setPlaceholderText(QStringLiteral("Select an SVG file..."));
-    m_inputFile->setText(settings.value(QStringLiteral("lastInputFile")).toString());
+    // ── Input files ────────────────────────────────────────────────────────
+    auto *fileGroup = new QGroupBox(QStringLiteral("Input — SVG files"), this);
+    auto *fileGroupLayout = new QVBoxLayout(fileGroup);
+
+    m_fileList = new QListWidget(this);
+    m_fileList->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_fileList->setMaximumHeight(120);
+    fileGroupLayout->addWidget(m_fileList);
+
+    auto *fileBtnLayout = new QHBoxLayout();
     auto *browseInBtn = new QPushButton(QStringLiteral("Browse..."), this);
-    fileLayout->addWidget(m_inputFile, 1);
-    fileLayout->addWidget(browseInBtn);
+    auto *clearFilesBtn = new QPushButton(QStringLiteral("Clear selected"), this);
+    fileBtnLayout->addWidget(browseInBtn);
+    fileBtnLayout->addWidget(clearFilesBtn);
+    fileBtnLayout->addStretch();
+    fileGroupLayout->addLayout(fileBtnLayout);
     mainLayout->addWidget(fileGroup);
 
     // ── Output directory ────────────────────────────────────────────────────
@@ -170,19 +236,23 @@ NestingDialog::NestingDialog(QWidget *parent)
     outLayout->addWidget(browseOutBtn);
     mainLayout->addWidget(outGroup);
 
-    // ── Bin size ────────────────────────────────────────────────────────────
+    // ── Bin selection ───────────────────────────────────────────────────────
     auto *binGroup = new QGroupBox(QStringLiteral("Bin"), this);
-    auto *binLayout = new QFormLayout(binGroup);
-    m_binSize = new QComboBox(this);
-    m_binSize->addItem(QStringLiteral("841 mm (A0)"), 841.0);
-    m_binSize->addItem(QStringLiteral("950 mm"), 950.0);
-    binLayout->addRow(QStringLiteral("Width:"), m_binSize);
+    auto *binLayout = new QHBoxLayout(binGroup);
+    m_binA0 = new QCheckBox(QStringLiteral("841 mm (A0)"), this);
+    m_binA0->setChecked(true);
+    m_bin950 = new QCheckBox(QStringLiteral("950 mm"), this);
+    m_bin950->setChecked(true);
+    binLayout->addWidget(m_binA0);
+    binLayout->addWidget(m_bin950);
+    binLayout->addStretch();
     mainLayout->addWidget(binGroup);
 
     // ── Progress bar ────────────────────────────────────────────────────────
     m_progress = new QProgressBar(this);
     m_progress->setVisible(false);
-    m_progress->setRange(0, 0); // indeterminate
+    m_progress->setRange(0, 1);
+    m_progress->setValue(0);
     mainLayout->addWidget(m_progress);
 
     // ── Run button ──────────────────────────────────────────────────────────
@@ -200,34 +270,62 @@ NestingDialog::NestingDialog(QWidget *parent)
     auto *closeBtn = new QPushButton(QStringLiteral("Close"), this);
     mainLayout->addWidget(closeBtn);
 
+    // ── Progress timer ──────────────────────────────────────────────────────
+    m_progressTimer = new QTimer(this);
+    m_progressTimer->setInterval(150);
+    connect(m_progressTimer, &QTimer::timeout, this, &NestingDialog::onProgressTick);
+
     // ── Connections ─────────────────────────────────────────────────────────
-    connect(browseInBtn, &QPushButton::clicked, this, &NestingDialog::browseInputFile);
+    connect(browseInBtn, &QPushButton::clicked, this, &NestingDialog::addFiles);
+    connect(clearFilesBtn, &QPushButton::clicked, this, &NestingDialog::removeSelectedFiles);
     connect(browseOutBtn, &QPushButton::clicked, this, &NestingDialog::browseOutputDir);
     connect(m_runButton, &QPushButton::clicked, this, &NestingDialog::runNesting);
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::close);
 }
 
-void NestingDialog::browseInputFile()
+void NestingDialog::addFiles()
 {
     QSettings settings;
     const QString lastDir = settings.value(QStringLiteral("lastInputDir")).toString();
-    const QString path = QFileDialog::getOpenFileName(
+    const QStringList paths = QFileDialog::getOpenFileNames(
         this,
-        QStringLiteral("Open SVG file"),
+        QStringLiteral("Select SVG files"),
         lastDir,
         QStringLiteral("SVG files (*.svg);;All files (*)"));
-    if (path.isEmpty())
+    if (paths.isEmpty())
         return;
-    m_inputFile->setText(path);
-    settings.setValue(QStringLiteral("lastInputFile"), path);
-    settings.setValue(QStringLiteral("lastInputDir"), QFileInfo(path).absolutePath());
 
-    // Auto-fill output dir from input file's directory if not already set
-    if (m_outputDir->text().isEmpty()) {
-        const QString dir = QFileInfo(path).absolutePath();
+    for (const QString &path : paths) {
+        // Avoid duplicates
+        bool found = false;
+        for (int i = 0; i < m_fileList->count(); ++i) {
+            if (m_fileList->item(i)->text() == path) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            m_fileList->addItem(path);
+    }
+
+    settings.setValue(QStringLiteral("lastInputDir"), QFileInfo(paths.last()).absolutePath());
+
+    // Auto-fill output dir from first file's directory if not already set
+    if (m_outputDir->text().isEmpty() && m_fileList->count() > 0) {
+        const QString dir = QFileInfo(m_fileList->item(0)->text()).absolutePath();
         m_outputDir->setText(dir);
         settings.setValue(QStringLiteral("lastExportDir"), dir);
     }
+
+    m_status->setText(QStringLiteral("%1 file(s) in list.").arg(m_fileList->count()));
+}
+
+void NestingDialog::removeSelectedFiles()
+{
+    QList<QListWidgetItem *> selected = m_fileList->selectedItems();
+    for (QListWidgetItem *item : selected)
+        delete item;
+    m_status->setText(QStringLiteral("%1 file(s) in list.").arg(m_fileList->count()));
 }
 
 void NestingDialog::browseOutputDir()
@@ -248,89 +346,105 @@ void NestingDialog::updateOutputDir(const QString &path)
 
 void NestingDialog::runNesting()
 {
-    const QString svgPath = m_inputFile->text();
-    if (svgPath.isEmpty()) {
-        m_status->setText(QStringLiteral("Please select an SVG file first."));
+    // ── Validate input ──────────────────────────────────────────────────────
+    if (m_fileList->count() == 0) {
+        m_status->setText(QStringLiteral("Please add at least one SVG file."));
         return;
     }
 
-    const QFileInfo fi(svgPath);
-    if (!fi.exists()) {
-        m_status->setText(QStringLiteral("File not found: ") + svgPath);
+    if (!m_binA0->isChecked() && !m_bin950->isChecked()) {
+        m_status->setText(QStringLiteral("Please select at least one bin size."));
         return;
     }
 
-    const double binWidthMm = m_binSize->currentData().toDouble();
+    QString exportDir = m_outputDir->text();
+    if (exportDir.isEmpty()) {
+        m_status->setText(QStringLiteral("Please select an output directory."));
+        return;
+    }
+    QSettings().setValue(QStringLiteral("lastExportDir"), exportDir);
 
-    m_runButton->setEnabled(false);
+    // ── Build job list ─────────────────────────────────────────────────────
+    QVector<BatchJob> jobs;
+    for (int i = 0; i < m_fileList->count(); ++i) {
+        const QString &path = m_fileList->item(i)->text();
+        if (!QFileInfo::exists(path)) {
+            m_status->setText(QStringLiteral("File not found: ") + path);
+            return;
+        }
+        if (m_binA0->isChecked())
+            jobs.append({path, 841.0, QStringLiteral("_nestingA0")});
+        if (m_bin950->isChecked())
+            jobs.append({path, 950.0, QStringLiteral("_nesting")});
+    }
+
+    // ── Setup progress ─────────────────────────────────────────────────────
+    m_jobIndex.store(0, std::memory_order_relaxed);
+    m_jobStatus = QStringLiteral("Starting...");
     m_progress->setVisible(true);
-    m_status->setText(QStringLiteral("Nesting in progress (may take 60+ seconds)..."));
+    m_progress->setRange(0, jobs.size());
+    m_progress->setValue(0);
+    m_runButton->setEnabled(false);
+    m_progressTimer->start();
 
-    // ── Run pipeline in background thread ────────────────────────────────────
-    auto *watcher = new QFutureWatcher<NestingResult>(this);
-    connect(watcher, &QFutureWatcher<NestingResult>::finished, this,
-        [this, watcher, svgPath, binWidthMm, fi]()
+    // ── Progress data for the worker ───────────────────────────────────────
+    BatchProgress prog;
+    prog.jobIndex  = &m_jobIndex;
+    prog.jobStatus = &m_jobStatus;
+    prog.mutex     = &m_statusMutex;
+
+    // Shared error list (filled by worker, read on finish)
+    auto errors = std::make_shared<QStringList>();
+
+    // ── Run batch in background thread ──────────────────────────────────────
+    const int totalJobs = jobs.size();
+    auto *watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+        [this, watcher, totalJobs, errors]()
     {
-        NestingResult r = watcher->result();
         watcher->deleteLater();
-
+        m_progressTimer->stop();
         m_progress->setVisible(false);
-
-        if (!r.success) {
-            m_status->setText(r.error);
-            m_runButton->setEnabled(true);
-            return;
-        }
-
-        // ── Save dialog in persisted or input-file directory ─────────────────
-        QString exportDir = m_outputDir->text();
-        if (exportDir.isEmpty())
-            exportDir = fi.absolutePath();
-
-        // Persist the directory
-        QSettings().setValue(QStringLiteral("lastExportDir"), exportDir);
-
-        const QString baseName = fi.completeBaseName();
-        const QString suffix = (binWidthMm <= 841.0)
-            ? QStringLiteral("_nestingA0") : QStringLiteral("_nesting");
-        const QString defaultPath = exportDir + QLatin1Char('/')
-            + baseName + suffix + QStringLiteral(".svg");
-        const QString outputSvg = QFileDialog::getSaveFileName(
-            this,
-            QStringLiteral("Save nested SVG"),
-            defaultPath,
-            QStringLiteral("SVG files (*.svg);;All files (*)"));
-
-        if (outputSvg.isEmpty()) {
-            m_status->setText(QStringLiteral("Cancelled."));
-            m_runButton->setEnabled(true);
-            return;
-        }
-
-        // Persist the chosen directory
-        updateOutputDir(QFileInfo(outputSvg).absolutePath());
-
-        // ── Write nested SVG ──────────────────────────────────────────────
-        m_status->setText(QStringLiteral("Writing nested SVG..."));
-        QApplication::processEvents();
-
-        NestedSvgWriter writer;
-        if (!writer.write(svgPath, outputSvg, r.placements, r.fp,
-                         binWidthMm, r.usedHeightMm)) {
-            m_status->setText(QStringLiteral("Failed to write nested SVG."));
-            m_runButton->setEnabled(true);
-            return;
-        }
-
-        m_status->setText(QStringLiteral("Done in %1 s — %2 footprints, %3 pieces, height %4 mm — %5")
-                              .arg(r.elapsed, 0, 'f', 1)
-                              .arg(r.fp.polygons.size())
-                              .arg(r.totalPieces)
-                              .arg(r.usedHeightMm, 0, 'f', 0)
-                              .arg(outputSvg));
         m_runButton->setEnabled(true);
+
+        // Final tick to show last status
+        onProgressTick();
+
+        const int total = totalJobs;
+        const int failed = errors->size();
+        if (failed == 0) {
+            m_status->setText(QStringLiteral("All %1 job(s) completed successfully.").arg(total));
+        } else {
+            m_status->setText(QStringLiteral("%1/%2 job(s) failed.\n%3")
+                                  .arg(failed).arg(total).arg(errors->join(QLatin1Char('\n'))));
+        }
     });
 
-    QFuture<NestingResult> future = QtConcurrent::run(&runPipeline, svgPath, binWidthMm);
+    QFuture<void> future = QtConcurrent::run([jobs, exportDir, prog, errors]() {
+        runBatch(jobs, exportDir, prog, *errors);
+    });
     watcher->setFuture(future);
+}
+
+void NestingDialog::onProgressTick()
+{
+    const int idx = m_jobIndex.load(std::memory_order_relaxed);
+    m_progress->setValue(idx);
+
+    QString status;
+    {
+        QMutexLocker lock(&m_statusMutex);
+        status = m_jobStatus;
+    }
+    if (!status.isEmpty())
+        m_status->setText(status);
+}
+
+void NestingDialog::closeEvent(QCloseEvent *event)
+{
+    if (m_progressTimer->isActive()) {
+        event->ignore();
+        return;
+    }
+    event->accept();
 }
