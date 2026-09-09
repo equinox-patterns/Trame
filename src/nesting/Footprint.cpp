@@ -16,6 +16,10 @@
 
 #include <QHash>
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 namespace Footprint {
 
 Result compute(const QVector<SizeLayer> &layers)
@@ -85,6 +89,40 @@ Result compute(const QVector<SizeLayer> &layers)
         result.names.push_back(pieceDisplayName.value(it.key()));
         result.keys.push_back(it.key());
         result.sizeCounts.push_back(count);
+    }
+
+    // Deterministic, process-independent ordering.
+    // The loop above iterates a QHash, whose iteration order is arbitrary and
+    // differs per process — without this sort the engine would receive the same
+    // pieces in a different order on every run (equal-area pieces shuffle), so
+    // nests are not reproducible. Order: area descending (matches the engine's
+    // initial area heuristic), then by piece key so identical-area pieces get a
+    // stable, content-based order.
+    {
+        std::vector<int> idx(result.polygons.size());
+        for (size_t i = 0; i < idx.size(); ++i)
+            idx[i] = static_cast<int>(i);
+
+        std::sort(idx.begin(), idx.end(), [&result](int a, int b) {
+            const double aa = std::fabs(Clipper2Lib::Area(result.polygons[a]));
+            const double ab = std::fabs(Clipper2Lib::Area(result.polygons[b]));
+            if (aa != ab)
+                return aa > ab;   // area descending
+            return result.keys[a] < result.keys[b];   // stable tie-break
+        });
+
+        Result sorted;
+        sorted.polygons.reserve(result.polygons.size());
+        sorted.names.reserve(result.names.size());
+        sorted.keys.reserve(result.keys.size());
+        sorted.sizeCounts.reserve(result.sizeCounts.size());
+        for (int i : idx) {
+            sorted.polygons.push_back(std::move(result.polygons[i]));
+            sorted.names.push_back(std::move(result.names[i]));
+            sorted.keys.push_back(std::move(result.keys[i]));
+            sorted.sizeCounts.push_back(result.sizeCounts[i]);
+        }
+        result = std::move(sorted);
     }
 
     return result;
