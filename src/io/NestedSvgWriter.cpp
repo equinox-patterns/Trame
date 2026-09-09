@@ -13,6 +13,7 @@
  *************************************************************************/
 
 #include "NestedSvgWriter.h"
+#include "GradedSvgContract.h"
 
 #include <QDebug>
 #include <QDomDocument>
@@ -58,11 +59,25 @@ QString makeTransform(double px, double py, double deg, double ox, double oy)
     return s;
 }
 
-/// Check if an element is a size layer (<g i:layer="yes"> that is NOT Mise en page).
-bool isMiseEnPage(const QString &id)
+/// Check whether a top-level <g> is the decor layer of the graded SVG —
+/// identified by the ostara:layout backend marker (contract with the Ostara writer).
+bool isLayoutLayer(const QDomElement &layerEl)
 {
-    return id.contains(QStringLiteral("Mise"), Qt::CaseInsensitive)
-           || id.contains(QStringLiteral("en page"), Qt::CaseInsensitive);
+    return layerEl.attribute(QLatin1String(kGradedLayoutLayerAttr))
+               == QLatin1String(kGradedLayoutLayerMarker);
+}
+
+/// Remove a trailing "_<digits>" dedup suffix added by the Ostara writer's
+/// uniqueId() (ogradedsvgwriter.cpp) when an id repeats inside a layer.
+/// Returns the base id, or an empty string when there is no such suffix.
+QString stripDedupSuffix(const QString &id)
+{
+    const int us = id.lastIndexOf(QLatin1Char('_'));
+    if (us <= 0) return {};
+    for (int c = us + 1; c < id.size(); ++c) {
+        if (!id.at(c).isDigit()) return {};
+    }
+    return id.left(us);
 }
 
 bool isAiLayer(const QDomElement &el)
@@ -149,7 +164,7 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
     for (int i = 0; i < topChildren.size(); ++i) {
         QDomElement layerEl = topChildren.at(i).toElement();
         if (layerEl.isNull() || !isAiLayer(layerEl)) continue;
-        if (isMiseEnPage(layerEl.attribute(QStringLiteral("id")))) continue;
+        if (isLayoutLayer(layerEl)) continue;
 
         // Walk children: direct pieces or group wrappers
         const QDomNodeList layerChildren = layerEl.childNodes();
@@ -206,14 +221,15 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
         }
     }
 
-    // ── 5. Walk MEP layer and apply transforms ───────────────────────────────
-    // The MEP layer contains piece wrappers (<g id="Dos" i:layer="yes">)
-    // each holding _grain and _label children. Apply the transform ONLY to
-    // the wrappers — children inherit it, avoiding double transformation.
+    // ── 5. Walk the decor layer and apply transforms ──────────────
+    // It contains one wrapper per piece/group (<g id="Dos" i:layer="yes">)
+    // holding the decor (grainline/fold, info blocks, annotations). Apply the
+    // transform ONLY to the wrappers — children inherit it, avoiding double
+    // transformation and keeping each block's own rotation intact.
     for (int i = 0; i < topChildren.size(); ++i) {
         QDomElement layerEl = topChildren.at(i).toElement();
         if (layerEl.isNull() || !isAiLayer(layerEl)) continue;
-        if (!isMiseEnPage(layerEl.attribute(QStringLiteral("id")))) continue;
+        if (!isLayoutLayer(layerEl)) continue;
 
         const QDomNodeList mepChildren = layerEl.childNodes();
         for (int j = 0; j < mepChildren.size(); ++j) {
@@ -224,7 +240,7 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
             const QString pieceName = el.attribute(QStringLiteral("id"));
             auto it = xforms.find(pieceName);
             if (it == xforms.end()) {
-                // Try piece→group mapping (for grouped pieces whose MEP
+                // Try piece→group mapping (for grouped pieces whose decor
                 // wrapper is keyed by individual piece name, not group name)
                 const QString group = pieceToGroup.value(pieceName);
                 if (!group.isEmpty())
@@ -235,6 +251,19 @@ bool NestedSvgWriter::write(const QString              &inputSvg,
                     if (k.endsWith(QStringLiteral("::") + pieceName)) {
                         it = xforms.find(k);
                         break;
+                    }
+                }
+            }
+            if (it == xforms.end()) {
+                // Ostara's writer dedups repeated ids with a numeric suffix
+                // ("_1", "_2", …) via its uniqueId() — retry without it.
+                const QString stripped = stripDedupSuffix(pieceName);
+                if (!stripped.isEmpty()) {
+                    it = xforms.find(stripped);
+                    if (it == xforms.end()) {
+                        const QString group = pieceToGroup.value(stripped);
+                        if (!group.isEmpty())
+                            it = xforms.find(group);
                     }
                 }
             }

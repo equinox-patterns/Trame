@@ -16,8 +16,6 @@
 #ifndef SVGREADER_H
 #define SVGREADER_H
 
-#include <QHash>
-
 #include "model/Piece.h"
 
 class SvgReader
@@ -28,20 +26,7 @@ public:
     SvgReader() = default;
 
     /// Parse a graded SVG and return one SizeLayer per size.
-    /// Also populates mepPaths with Mise-en-page layer paths, keyed by piece name.
     bool read(const QString &filePath, QVector<SizeLayer> &layers);
-
-    /// Parse and return a single size layer by index (0 = smallest).
-    /// Convenience for V0 single-size nesting.
-    bool readSingleLayer(const QString &filePath, SizeLayer &layer, int index = 0);
-
-    /// Mise-en-page paths extracted from the MEP SVG layer (grainlines).
-    /// Key: piece group name (empty for standalone pieces) or "GroupName::PieceName".
-    QHash<QString, QVector<MepPath>> mepPaths;
-
-    /// Mise-en-page labels extracted from the MEP SVG layer (text + logos).
-    /// Same key scheme as mepPaths.
-    QHash<QString, QVector<MepLabel>> mepLabels;
 
 private:
     // SVG path data parser — returns sub-paths split at each M command

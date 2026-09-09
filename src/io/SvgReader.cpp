@@ -14,6 +14,7 @@
  *************************************************************************/
 
 #include "SvgReader.h"
+#include "GradedSvgContract.h"
 
 #include <QDebug>
 #include <QDomDocument>
@@ -93,12 +94,12 @@ bool isAiLayer(const QDomElement &el)
     return false;
 }
 
-/// Check if a layer is the "Mise en page" layer (layout/labels only, no contours).
-bool isMiseEnPage(const QDomElement &layerEl)
+/// Check if a layer is the decor layer of the graded SVG — identified by the
+/// ostara:layout backend marker (contract with the Ostara writer).
+bool isLayoutLayer(const QDomElement &layerEl)
 {
-    const QString id = layerEl.attribute(QStringLiteral("id"));
-    return id.contains(QStringLiteral("Mise"), Qt::CaseInsensitive)
-           || id.contains(QStringLiteral("en page"), Qt::CaseInsensitive);
+    return layerEl.attribute(QLatin1String(kGradedLayoutLayerAttr))
+               == QLatin1String(kGradedLayoutLayerMarker);
 }
 
 } // anonymous namespace
@@ -186,26 +187,6 @@ QVector<Clipper2Lib::Path64> SvgReader::parsePathData(const QString &d) const
     return subPaths;
 }
 
-// ── Helper: extract paths from a piece <g> element ─────────────────────────
-
-static void extractPiecePaths(const QDomElement &pieceG,
-                              QVector<Clipper2Lib::Path64> &paths)
-{
-    const QDomNodeList children = pieceG.childNodes();
-    for (int i = 0; i < children.size(); ++i) {
-        const QDomElement el = children.at(i).toElement();
-        if (el.isNull() || el.tagName() != QStringLiteral("path")) continue;
-
-        const QString d = el.attribute(QStringLiteral("d"));
-        if (d.isEmpty()) continue;
-
-        // Defer parsing — SvgReader will handle it
-        paths.append(Clipper2Lib::Path64{});
-        // Store the raw path for now, parse in the reader
-        // (We use a workaround: parse inline in the reader)
-    }
-}
-
 // ── Main reader ────────────────────────────────────────────────────────────
 //
 // SVG structure (graded export):
@@ -220,7 +201,9 @@ static void extractPiecePaths(const QDomElement &pieceG,
 //         <g id="Piece2">...</g>
 //       </g>
 //     </g>
-//     <g id="Mise en page" i:layer="yes">   ← layout layer (skip)
+//     <g id="Mise_en_page" i:layer="yes" ostara:layout="yes">  ← decor layer (skip)
+//       <g id="Front" i:layer="yes">          decor wrapper (grain/fold/blocks)
+//       </g>
 //     </g>
 //   </svg>
 
@@ -292,14 +275,12 @@ bool SvgReader::read(const QString &filePath, QVector<SizeLayer> &layers)
 
     // Iterate top-level children: find size layers (g with i:layer="yes")
     const QDomNodeList topChildren = svg.childNodes();
-    QDomElement mepLayerElement; // preserve MEP layer for later processing
     for (int i = 0; i < topChildren.size(); ++i) {
         const QDomElement el = topChildren.at(i).toElement();
         if (el.isNull()) continue;
         if (!isAiLayer(el)) continue;
-        if (isMiseEnPage(el)) {
-            mepLayerElement = el; // save for later, don't skip
-            continue;
+        if (isLayoutLayer(el)) {
+            continue; // decor layer: no geometry, not a size layer
         }
 
         SizeLayer layer;
@@ -310,40 +291,6 @@ bool SvgReader::read(const QString &filePath, QVector<SizeLayer> &layers)
         const QDomElement titleEl = el.firstChildElement(QStringLiteral("title"));
         if (!titleEl.isNull() && !titleEl.text().isEmpty()) {
             layer.label = titleEl.text();
-        }
-
-        // Extract a numeric size value from the label.
-        // Handles: "80-84", "Size 46", "Taille 38", "38", "46 – 50"
-        {
-            double v = 0;
-            bool ok = false;
-
-            // First try: label contains a dash/en-dash range (e.g. "80-84")
-            int dash = layer.label.indexOf(QLatin1Char('-'));
-            const int enDash = layer.label.indexOf(QChar(0x2013));
-            if (dash < 0 || (enDash >= 0 && enDash < dash)) dash = enDash;
-            if (dash > 0) {
-                v = layer.label.left(dash).trimmed().toDouble(&ok);
-            }
-
-            // Second try: find the first number in the string
-            if (!ok) {
-                int numStart = -1;
-                int numEnd   = -1;
-                for (int i = 0; i < layer.label.size(); ++i) {
-                    if (layer.label[i].isDigit() || layer.label[i] == QLatin1Char('.')) {
-                        if (numStart < 0) numStart = i;
-                        numEnd = i + 1;
-                    } else if (numStart >= 0) {
-                        break;
-                    }
-                }
-                if (numStart >= 0) {
-                    v = QStringView(layer.label.constData() + numStart, numEnd - numStart).toDouble(&ok);
-                }
-            }
-
-            if (ok) layer.sizeValue = v;
         }
 
         // Iterate direct children: each is either a piece or a group wrapper
@@ -401,18 +348,6 @@ bool SvgReader::read(const QString &filePath, QVector<SizeLayer> &layers)
                 piece.contourNodes.append(cn);
             }
 
-            // All other sub-paths → internal paths (passmarks, grainlines, etc.)
-            for (int i = 0; i < allSubPaths.size(); ++i) {
-                if (i == largestIdx) continue;
-                InternalPath ip;
-                ip.pathId   = static_cast<quint32>(i);
-                ip.polyline = allSubPaths[i].poly;
-                piece.internalPaths.append(ip);
-            }
-
-            GradedSize sz;
-            sz.contour = piece.contour();
-            piece.sizes.append(sz);
             layer.pieces.append(piece);
         };
 
@@ -460,251 +395,5 @@ bool SvgReader::read(const QString &filePath, QVector<SizeLayer> &layers)
         }
     }
 
-    // Extract <style> elements from the original SVG for inclusion in label wrappers
-    QString globalStyles;
-    {
-        const QDomNodeList styleNodes = svg.elementsByTagName(QStringLiteral("style"));
-        for (int i = 0; i < styleNodes.size(); ++i) {
-            const QDomElement styleEl = styleNodes.at(i).toElement();
-            if (!styleEl.isNull()) {
-                QString s;
-                QTextStream ts(&s);
-                styleEl.save(ts, 0);
-                globalStyles += s + QStringLiteral("\n");
-            }
-        }
-    }
-
-    // Process Mise-en-page layer: extract grainline paths and label text/logos per piece
-    if (!mepLayerElement.isNull()) {
-        // Helper: recursively collect all <path> descendants from a DOM element
-        struct PathCollect {
-            QVector<Clipper2Lib::Path64> polys;
-            PathStyle style;
-        };
-        auto collectPaths = [&](auto &self, const QDomElement &parent,
-                                 QVector<PathCollect> &out) -> void {
-            const QDomNodeList children = parent.childNodes();
-            for (int i = 0; i < children.size(); ++i) {
-                const QDomElement child = children.at(i).toElement();
-                if (child.isNull()) continue;
-                if (child.tagName() == QStringLiteral("path")) {
-                    const QString d = child.attribute(QStringLiteral("d"));
-                    if (d.isEmpty()) continue;
-                    PathCollect pc;
-                    pc.style = extractPathStyle(child);
-                    const auto subPaths = parsePathData(d);
-                    for (const auto &sp : subPaths) {
-                        if (!sp.empty())
-                            pc.polys.append(sp);
-                    }
-                    if (!pc.polys.isEmpty())
-                        out.append(std::move(pc));
-                } else if (child.tagName() == QStringLiteral("g")) {
-                    self(self, child, out);
-                }
-            }
-        };
-
-        // Helper: serialize a DOM element to an SVG string
-        auto serializeElement = [](const QDomElement &el) -> QString {
-            QString s;
-            QTextStream ts(&s);
-            el.save(ts, 0);
-            return s;
-        };
-
-        // Helper: extract labels (text + SVG fragments) from a *_label_* group
-        auto extractLabels = [&](auto &self, const QDomElement &parent,
-                                  QVector<MepLabel> &out) -> void {
-            const QDomNodeList children = parent.childNodes();
-            for (int i = 0; i < children.size(); ++i) {
-                const QDomElement child = children.at(i).toElement();
-                if (child.isNull()) continue;
-                if (child.tagName() == QStringLiteral("text")) {
-                    MepLabel lbl;
-                    lbl.type = MepLabel::Text;
-                    lbl.text = child.text();
-                    lbl.fontFamily = child.attribute(QStringLiteral("font-family"));
-                    lbl.fontSize   = child.attribute(QStringLiteral("font-size"))
-                                        .replace(QStringLiteral("pt"), QString()).toDouble();
-                    lbl.fontWeight = child.attribute(QStringLiteral("font-weight"));
-                    const QString fillAttr = child.attribute(QStringLiteral("fill"));
-                    if (!fillAttr.isEmpty())
-                        lbl.fill = fillAttr;
-                    lbl.x = child.attribute(QStringLiteral("x")).toDouble();
-                    lbl.y = child.attribute(QStringLiteral("y")).toDouble();
-                    // Handle transform on the text element itself
-                    const QString tx = child.attribute(QStringLiteral("transform"));
-                    if (!tx.isEmpty())
-                        lbl.transform = tx;
-                    if (!lbl.text.isEmpty())
-                        out.append(std::move(lbl));
-                } else if (child.tagName() == QStringLiteral("g")) {
-                    // Check if this is a logo group (has defs/style/path children)
-                    const QString cid = child.attribute(QStringLiteral("id"));
-                    const bool isLabelNested = cid.contains(QStringLiteral("_label_"));
-                    // Recurse into non-label groups (logos) or handle directly
-                    const QDomNodeList gc = child.childNodes();
-                    bool hasDefs = false;
-                    for (int j = 0; j < gc.size(); ++j) {
-                        const QDomElement gce = gc.at(j).toElement();
-                        if (!gce.isNull() && gce.tagName() == QStringLiteral("defs"))
-                            hasDefs = true;
-                    }
-                    if (hasDefs || isLabelNested) {
-                        // Serialize as SVG fragment
-                        MepLabel lbl;
-                        lbl.type = MepLabel::SvgFragment;
-                        lbl.svgContent = serializeElement(child);
-                        const QString tx = child.attribute(QStringLiteral("transform"));
-                        if (!tx.isEmpty())
-                            lbl.transform = tx;
-                        out.append(std::move(lbl));
-                    } else {
-                        self(self, child, out);
-                    }
-                }
-            }
-        };
-
-        const QDomNodeList mepChildren = mepLayerElement.childNodes();
-        // Helper: extract a reference position from a label group.
-        // Uses the first <text> element if present; otherwise parses
-        // translate(x,y) from the first child <g> transform attribute.
-        auto labelRefPos = [](const QDomElement &labelGroup) -> QPair<double, double> {
-            const QDomNodeList texts = labelGroup.elementsByTagName(QStringLiteral("text"));
-            if (!texts.isEmpty()) {
-                const QDomElement firstText = texts.at(0).toElement();
-                return {firstText.attribute(QStringLiteral("x")).toDouble(),
-                        firstText.attribute(QStringLiteral("y")).toDouble()};
-            }
-            // No text — try the first child <g> with a translate() transform
-            const QDomNodeList children = labelGroup.childNodes();
-            for (int i = 0; i < children.size(); ++i) {
-                const QDomElement child = children.at(i).toElement();
-                if (child.isNull() || child.tagName() != QStringLiteral("g")) continue;
-                const QString tx = child.attribute(QStringLiteral("transform"));
-                const int tp = tx.indexOf(QStringLiteral("translate("));
-                if (tp < 0) continue;
-                const int tEnd = tx.indexOf(QLatin1Char(')'), tp + 10);
-                if (tEnd < 0) continue;
-                const QStringList parts = tx.mid(tp + 10, tEnd - tp - 10).split(QLatin1Char(','));
-                if (parts.size() >= 2)
-                    return {parts[0].trimmed().toDouble(), parts[1].trimmed().toDouble()};
-                break;
-            }
-            return {0.0, 0.0};
-        };
-
-        // First pass: derive pieceKey for each direct child (flat structure)
-        // and handle _grain/_label groups that are direct children of Mise_en_page.
-        QHash<QString, int> pieceBlockCounters; // per-pieceKey block id counter
-        for (int i = 0; i < mepChildren.size(); ++i) {
-            const QDomElement pieceG = mepChildren.at(i).toElement();
-            if (pieceG.isNull() || pieceG.tagName() != QStringLiteral("g")) continue;
-
-            const QString pieceId = pieceG.attribute(QStringLiteral("id"));
-            // Remove suffix ("_grain", "_label_1", etc.) to get the canonical piece key
-            QString pieceKey = pieceId;
-            const int usIdx = pieceKey.lastIndexOf(QLatin1Char('_'));
-            if (usIdx >= 0) {
-                const QString suffix = pieceKey.mid(usIdx);
-                if (suffix == QStringLiteral("_grain") || suffix.startsWith(QStringLiteral("_label_")))
-                    pieceKey = pieceKey.left(usIdx);
-            }
-
-            // Handle flat structure: pieceG IS a _grain or _label group
-            if (pieceId.endsWith(QStringLiteral("_grain"))) {
-                QVector<PathCollect> collected;
-                collectPaths(collectPaths, pieceG, collected);
-                auto &vec = mepPaths[pieceKey];
-                for (auto &pc : collected) {
-                    for (auto &poly : pc.polys) {
-                        MepPath mp;
-                        mp.polyline = std::move(poly);
-                        mp.style = pc.style;
-                        vec.append(std::move(mp));
-                    }
-                }
-            } else if (pieceId.contains(QStringLiteral("_label"))) {
-                int &blockCounter = pieceBlockCounters[pieceKey];
-                const int currentBlock = blockCounter++;
-
-                const auto [refX, refY] = labelRefPos(pieceG);
-
-                const QString rawXml = serializeElement(pieceG);
-                const QString wrapped = QStringLiteral(
-                    "<svg xmlns=\"http://www.w3.org/2000/svg\">\n%1%2\n</svg>").arg(globalStyles, rawXml);
-
-                MepLabel block;
-                block.type = MepLabel::RasterBlock;
-                block.svgContent = wrapped;
-                block.x = refX;
-                block.y = refY;
-                block.origX = refX;
-                block.origY = refY;
-                block.blockId = currentBlock;
-                block.elementId = pieceId;
-                mepLabels[pieceKey].append(block);
-            }
-
-            // Also process children for wrapped structure
-            // (pieceG may contain nested _grain / _label child groups)
-            const QDomNodeList pcChildren = pieceG.childNodes();
-            for (int j = 0; j < pcChildren.size(); ++j) {
-                const QDomElement childG = pcChildren.at(j).toElement();
-                if (childG.isNull() || childG.tagName() != QStringLiteral("g")) continue;
-                const QString cid = childG.attribute(QStringLiteral("id"));
-
-                if (cid.endsWith(QStringLiteral("_grain"))) {
-                    QVector<PathCollect> collected;
-                    collectPaths(collectPaths, childG, collected);
-                    auto &vec = mepPaths[pieceKey];
-                    for (auto &pc : collected) {
-                        for (auto &poly : pc.polys) {
-                            MepPath mp;
-                            mp.polyline = std::move(poly);
-                            mp.style = pc.style;
-                            vec.append(std::move(mp));
-                        }
-                    }
-                } else if (cid.contains(QStringLiteral("_label"))) {
-                    int &blockCounter = pieceBlockCounters[pieceKey];
-                    const int currentBlock = blockCounter++;
-
-                const auto [refX, refY] = labelRefPos(childG);
-
-                    const QString rawXml = serializeElement(childG);
-                    const QString wrapped = QStringLiteral(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\">\n%1%2\n</svg>").arg(globalStyles, rawXml);
-
-                    MepLabel block;
-                    block.type = MepLabel::RasterBlock;
-                    block.svgContent = wrapped;
-                    block.x = refX;
-                    block.y = refY;
-                    block.origX = refX;
-                    block.origY = refY;
-                    block.blockId = currentBlock;
-                    mepLabels[pieceKey].append(block);
-                }
-            }
-        }
-    }
-
-    return true;
-}
-
-bool SvgReader::readSingleLayer(const QString &filePath, SizeLayer &layer, int index)
-{
-    QVector<SizeLayer> all;
-    if (!read(filePath, all)) return false;
-    if (all.isEmpty()) return false;
-
-    if (index < 0) index = 0;
-    if (index >= all.size()) index = all.size() - 1;
-
-    layer = all.at(index);
     return true;
 }

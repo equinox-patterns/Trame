@@ -32,9 +32,10 @@ public:
     ///
     /// Each piece <g> in every size layer gets a transform="translate(x,y) rotate(deg)"
     /// that moves it from its original position to its nested position.
-    /// MEP elements (grainlines, labels) are transformed identically.
+    /// The decor layer wrappers (grainline/fold, info blocks, annotations)
+    /// are transformed identically with their piece.
     ///
-    /// @param inputSvg   Original graded SVG from Valentina
+    /// @param inputSvg   Original graded SVG from Ostara
     /// @param outputSvg  Output nested SVG
     /// @param placements Nesting result (indexed by footprint order)
     /// @param fp         Footprint result (polygons for bbox, keys for identity)
