@@ -36,7 +36,25 @@
 #include "nesting/Engine.h"
 #include "nesting/Footprint.h"
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+
 // ── Pipeline result (packed for background thread) ─────────────────────────
+
+#if defined(__APPLE__)
+/// Ask macOS to keep this thread on the performance cores (USER_INTERACTIVE).
+/// Nesting is a single long CPU-bound thread and gets 2-4× slower when the
+/// scheduler demotes it to an efficiency core while the machine is busy.
+/// Must be called from the worker thread itself.
+static void preferPerformanceCores()
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
+#else
+static void preferPerformanceCores() {}
+#endif
 
 struct NestingResult
 {
@@ -429,6 +447,7 @@ void NestingDialog::runNesting()
 
     QFuture<JobOutcome> future =
         QtConcurrent::mapped(jobs, [exportDir, shared](const BatchJob &job) {
+            preferPerformanceCores();  // keep the nest off the efficiency cores
             JobOutcome o = processJob(job, exportDir, shared.get());
 
             // Publish progress: number of finished jobs + the job's rich status
