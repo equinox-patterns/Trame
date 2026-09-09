@@ -26,6 +26,12 @@
 
 class Bin;
 
+/// Axis-aligned bounding box in Clipper integer coordinates.
+struct BBox
+{
+    int64_t xMin, yMin, xMax, yMax;
+};
+
 /// Nesting engine — places pieces in a strip bin via NFP + simulated annealing.
 ///
 /// Receives a Bin (fixed width, unbounded height) and a list of polygons.
@@ -64,6 +70,19 @@ public:
                                  const std::vector<Clipper2Lib::Path64> &pieces) const;
 
 private:
+    // ── Precomputed per-(piece, rotation) geometry ───────────────────────
+
+    /// Everything that only depends on (piece, rotation) is computed once in
+    /// place() and reused across every annealing iteration. Previously these
+    /// were recomputed identically on each NFP cache miss / each placement.
+    struct RotGeom
+    {
+        Clipper2Lib::Path64 path;  ///< full rotated path, CCW
+        Clipper2Lib::Path64 neg;   ///< negatePath(path)
+        Clipper2Lib::Path64 aref;  ///< gap-inflated reference (== path when no inflation)
+        BBox                 bbox;
+    };
+
     // ── Geometry utilities (Clipper2 integer coordinates) ────────────────
 
     static constexpr double kScale = 1e6;
@@ -77,9 +96,9 @@ private:
     /// Sequential bottom-left placement for a given order and rotation indices.
     /// Returns the total height used in mm, or a very large value on failure.
     double placeSequential(const Bin &bin,
-                           const std::vector<std::vector<Clipper2Lib::Path64>> &rotBank,
-                           const std::vector<std::vector<Clipper2Lib::Path64>> &convexRotBank,
+                           const std::vector<std::vector<RotGeom>> &rotBank,
                            NFPCache &nfpCache,
+                           NFPCache &obstacleCache,
                            const std::vector<int> &rotIdx,
                            const std::vector<int> &order,
                            std::vector<Placement> &out,
@@ -88,9 +107,9 @@ private:
     // ── Optimisation ─────────────────────────────────────────────────────
 
     void anneal(const Bin &bin,
-                const std::vector<std::vector<Clipper2Lib::Path64>> &rotBank,
-                const std::vector<std::vector<Clipper2Lib::Path64>> &convexRotBank,
+                const std::vector<std::vector<RotGeom>> &rotBank,
                 NFPCache &nfpCache,
+                NFPCache &obstacleCache,
                 std::vector<Placement> &best,
                 int64_t infY) const;
 

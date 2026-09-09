@@ -145,55 +145,84 @@ struct BatchJob {
     QString suffix;
 };
 
-// ── Batch worker (runs in QtConcurrent::run) ──────────────────────────────
+// ── Batch worker (runs on the Qt thread pool) ─────────────────────────────
+// Each job is an independent nest: same input, same bin, fresh Engine with a
+// fixed per-run seed → a job's result is bit-identical whether jobs run
+// sequentially or in parallel. Jobs are therefore mapped concurrently over the
+// available cores (A1). A job is skipped when its output already exists and is
+// not older than its input (A2) — the existing artefact is kept as-is.
 
-struct BatchProgress {
-    std::atomic<int> *jobIndex  = nullptr;
-    QString          *jobStatus = nullptr;
-    QMutex           *mutex     = nullptr;
+struct BatchShared {
+    std::atomic<int> *done   = nullptr;  // completed jobs (progress)
+    int               total  = 0;
+    QString          *latest = nullptr;  // status of the job that just finished
+    QMutex           *mutex  = nullptr;
 };
 
-static void runBatch(const QVector<BatchJob> &jobs, const QString &outputDir,
-                     BatchProgress prog, QStringList &outErrors)
+struct JobOutcome {
+    bool    ok        = false;   // false → counted as a failure
+    bool    skipped   = false;   // output already up to date, nothing recomputed
+    QString label;               // "file.svg → 841 mm"
+    QString error;               // failure reason (parse / no footprints / write)
+    double  elapsed   = 0;
+    double  heightMm  = 0;
+    QString outputPath;
+};
+
+static JobOutcome processJob(const BatchJob &job, const QString &outputDir,
+                             BatchShared *shared)
 {
-    for (int i = 0; i < jobs.size(); ++i) {
-        const BatchJob &job = jobs[i];
-        const QFileInfo fi(job.svgPath);
-        const QString label = QStringLiteral("%1 → %2 mm").arg(fi.fileName()).arg(job.binWidthMm, 0, 'f', 0);
+    JobOutcome o;
+    const QFileInfo fi(job.svgPath);
+    o.label = QStringLiteral("%1 → %2 mm")
+                  .arg(fi.fileName()).arg(job.binWidthMm, 0, 'f', 0);
+    o.outputPath = outputDir + QLatin1Char('/')
+                 + fi.completeBaseName() + job.suffix + QStringLiteral(".svg");
 
-        NestingResult r = runPipeline(job.svgPath, job.binWidthMm);
-
-        QString statusLine;
-        if (!r.success) {
-            statusLine = QStringLiteral("[%1/%2] %3 — FAILED: %4")
-                             .arg(i + 1).arg(jobs.size()).arg(label, r.error);
-            outErrors.append(statusLine);
-        } else {
-            const QString outputPath = outputDir + QLatin1Char('/')
-                + fi.completeBaseName() + job.suffix + QStringLiteral(".svg");
-
-            NestedSvgWriter writer;
-            if (!writer.write(job.svgPath, outputPath, r.placements, r.fp,
-                             job.binWidthMm, r.usedHeightMm)) {
-                statusLine = QStringLiteral("[%1/%2] %3 — FAILED: could not write SVG")
-                                 .arg(i + 1).arg(jobs.size()).arg(label);
-                outErrors.append(statusLine);
-            } else {
-                statusLine = QStringLiteral("[%1/%2] %3 — Done in %4 s, height %5 mm → %6")
-                                 .arg(i + 1).arg(jobs.size()).arg(label)
-                                 .arg(r.elapsed, 0, 'f', 1)
-                                 .arg(r.usedHeightMm, 0, 'f', 0)
-                                 .arg(outputPath);
-            }
-        }
-
-        // Publish progress
-        prog.jobIndex->store(i + 1, std::memory_order_relaxed);
-        {
-            QMutexLocker lock(prog.mutex);
-            *prog.jobStatus = statusLine;
+    // A2 — skip if the artefact already exists and is not older than its input.
+    if (QFileInfo::exists(o.outputPath)) {
+        const QFileInfo in(job.svgPath), out(o.outputPath);
+        if (out.lastModified() >= in.lastModified()) {
+            o.ok      = true;
+            o.skipped = true;
+            return o;
         }
     }
+
+    NestingResult r = runPipeline(job.svgPath, job.binWidthMm);
+    if (!r.success) {
+        o.error = r.error;   // parse / no-footprints failure text
+        return o;
+    }
+
+    NestedSvgWriter writer;
+    if (!writer.write(job.svgPath, o.outputPath, r.placements, r.fp,
+                      job.binWidthMm, r.usedHeightMm)) {
+        o.error = QStringLiteral("could not write SVG");
+        return o;
+    }
+
+    o.ok       = true;
+    o.elapsed  = r.elapsed;
+    o.heightMm = r.usedHeightMm;
+    return o;
+}
+
+/// Authoritative one-line summary for a job (used for the final error list,
+/// in job order — mirrors the historical sequential messages).
+static QString jobStatusLine(const JobOutcome &o, int pos, int total)
+{
+    if (o.ok && o.skipped)
+        return QStringLiteral("[%1/%2] %3 — up to date, skipped")
+                   .arg(pos).arg(total).arg(o.label);
+    if (!o.ok)
+        return QStringLiteral("[%1/%2] %3 — FAILED: %4")
+                   .arg(pos).arg(total).arg(o.label, o.error);
+    return QStringLiteral("[%1/%2] %3 — Done in %4 s, height %5 mm → %6")
+               .arg(pos).arg(total).arg(o.label)
+               .arg(o.elapsed, 0, 'f', 1)
+               .arg(o.heightMm, 0, 'f', 0)
+               .arg(o.outputPath);
 }
 
 // ── NestingDialog ───────────────────────────────────────────────────────────
@@ -387,20 +416,31 @@ void NestingDialog::runNesting()
     m_runButton->setEnabled(false);
     m_progressTimer->start();
 
-    // ── Progress data for the worker ───────────────────────────────────────
-    BatchProgress prog;
-    prog.jobIndex  = &m_jobIndex;
-    prog.jobStatus = &m_jobStatus;
-    prog.mutex     = &m_statusMutex;
+    // ── Progress data shared with the concurrent workers ───────────────────
+    auto shared = std::make_shared<BatchShared>();
+    shared->done   = &m_jobIndex;
+    shared->total  = jobs.size();
+    shared->latest = &m_jobStatus;
+    shared->mutex  = &m_statusMutex;
 
-    // Shared error list (filled by worker, read on finish)
-    auto errors = std::make_shared<QStringList>();
-
-    // ── Run batch in background thread ──────────────────────────────────────
+    // ── Run jobs in parallel on the global Qt thread pool ──────────────────
     const int totalJobs = jobs.size();
-    auto *watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, this,
-        [this, watcher, totalJobs, errors]()
+    auto *watcher = new QFutureWatcher<JobOutcome>(this);
+
+    QFuture<JobOutcome> future =
+        QtConcurrent::mapped(jobs, [exportDir, shared](const BatchJob &job) {
+            JobOutcome o = processJob(job, exportDir, shared.get());
+
+            // Publish progress: number of finished jobs + the job's rich status
+            // line (done in X s, height Y mm → output), like the historical UI.
+            const int done = shared->done->fetch_add(1, std::memory_order_relaxed) + 1;
+            QMutexLocker lock(shared->mutex);
+            *shared->latest = jobStatusLine(o, done, shared->total);
+            return o;
+        });
+
+    connect(watcher, &QFutureWatcher<JobOutcome>::finished, this,
+        [this, watcher, shared]()
     {
         watcher->deleteLater();
         m_progressTimer->stop();
@@ -410,18 +450,26 @@ void NestingDialog::runNesting()
         // Final tick to show last status
         onProgressTick();
 
-        const int total = totalJobs;
-        const int failed = errors->size();
-        if (failed == 0) {
-            m_status->setText(QStringLiteral("All %1 job(s) completed successfully.").arg(total));
-        } else {
-            m_status->setText(QStringLiteral("%1/%2 job(s) failed.\n%3")
-                                  .arg(failed).arg(total).arg(errors->join(QLatin1Char('\n'))));
+        // Recap of every job, in input order (results() preserves order):
+        // one line per file/bin with its time, height and output path.
+        const QList<JobOutcome> outcomes = watcher->future().results();
+        const int total  = outcomes.size();
+        int failed = 0;
+        QStringList recap;
+        recap.reserve(total + 1);
+        int i = 0;
+        for (const JobOutcome &o : outcomes) {
+            if (!o.ok)
+                ++failed;
+            recap.append(jobStatusLine(o, i + 1, total));
+            ++i;
         }
-    });
 
-    QFuture<void> future = QtConcurrent::run([jobs, exportDir, prog, errors]() {
-        runBatch(jobs, exportDir, prog, *errors);
+        const QString header = (failed == 0)
+            ? QStringLiteral("All %1 job(s) completed successfully.").arg(total)
+            : QStringLiteral("%1/%2 job(s) failed.").arg(failed).arg(total);
+        recap.prepend(header);
+        m_status->setText(recap.join(QLatin1Char('\n')));
     });
     watcher->setFuture(future);
 }

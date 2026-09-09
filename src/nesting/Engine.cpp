@@ -25,37 +25,11 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// A large but safe height sentinel — tall enough for any practical strip.
-// We use the sum of all piece heights (computed at runtime) to avoid Clipper2
-// precision issues with near-infinite coordinates.
-static int64_t computeInfY(const std::vector<std::vector<Clipper2Lib::Path64>> &rotBank)
-{
-    int64_t totalH = 0;
-    for (const auto &bank : rotBank) {
-        if (bank.empty()) continue;
-        // Compute bbox inline to avoid dependency order issues
-        int64_t yMin = (std::numeric_limits<int64_t>::max)();
-        int64_t yMax = (std::numeric_limits<int64_t>::min)();
-        for (const auto &p : bank[0]) {
-            if (p.y < yMin) yMin = p.y;
-            if (p.y > yMax) yMax = p.y;
-        }
-        totalH += yMax - yMin;
-    }
-    // Add 50% margin
-    totalH = totalH + totalH / 2;
-    constexpr int64_t kMaxSafe = int64_t(1) << 50;
-    return totalH > 0 ? totalH : kMaxSafe;
-}
-
 // A very large double returned when placement fails for a given arrangement.
 constexpr double kBadHeight = 1e12;
 
 // ── Bounding box ─────────────────────────────────────────────────────────
-
-struct BBox {
-    int64_t xMin, yMin, xMax, yMax;
-};
+// BBox is declared in Engine.h (shared with the member precomputed geometry).
 
 BBox bboxFromPath(const Clipper2Lib::Path64 &path)
 {
@@ -137,53 +111,6 @@ inline bool nfpOutsideIFP(const BBox &bboxA, const BBox &bboxB,
         || nfpMinX >= ifpX1;
 }
 
-/// Monotone-chain convex hull (Andrew's algorithm).
-/// Returns the convex hull of the input path.
-Clipper2Lib::Path64 convexHull(const Clipper2Lib::Path64 &path)
-{
-    if (path.size() <= 3)
-        return path;
-
-    auto pts = path;
-    std::sort(pts.begin(), pts.end(),
-              [](const Clipper2Lib::Point64 &a, const Clipper2Lib::Point64 &b) {
-                  return a.x < b.x || (a.x == b.x && a.y < b.y);
-              });
-
-    Clipper2Lib::Path64 hull;
-    hull.resize(pts.size() * 2); // upper bound
-    int k = 0;
-
-    // Lower hull
-    for (const auto &p : pts) {
-        while (k >= 2) {
-            const auto &a = hull[k - 2];
-            const auto &b = hull[k - 1];
-            if ((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) > 0)
-                break;
-            --k;
-        }
-        hull[k++] = p;
-    }
-
-    // Upper hull
-    const int lowerLen = k;
-    for (int i = static_cast<int>(pts.size()) - 2; i >= 0; --i) {
-        const auto &p = pts[i];
-        while (k > lowerLen) {
-            const auto &a = hull[k - 2];
-            const auto &b = hull[k - 1];
-            if ((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) > 0)
-                break;
-            --k;
-        }
-        hull[k++] = p;
-    }
-
-    hull.resize(k > 0 ? k - 1 : 0); // remove duplicate last point
-    return hull;
-}
-
 } // anonymous namespace
 
 // ── Engine: geometry utilities ───────────────────────────────────────────────
@@ -223,9 +150,9 @@ Clipper2Lib::Path64 Engine::negatePath(const Clipper2Lib::Path64 &path)
 // ── Sequential placement ─────────────────────────────────────────────────────
 
 double Engine::placeSequential(const Bin &bin,
-                               const std::vector<std::vector<Clipper2Lib::Path64>> &rotBank,
-                               const std::vector<std::vector<Clipper2Lib::Path64>> &convexRotBank,
+                               const std::vector<std::vector<RotGeom>> &rotBank,
                                NFPCache &nfpCache,
+                               NFPCache &obstacleCache,
                                const std::vector<int> &rotIdx,
                                const std::vector<int> &order,
                                std::vector<Placement> &out,
@@ -233,7 +160,6 @@ double Engine::placeSequential(const Bin &bin,
 {
     const int64_t binW    = static_cast<int64_t>(bin.widthMm() * kScale);
     const int64_t margin  = static_cast<int64_t>(bin.marginMm() * kScale);
-    const int64_t halfGap = static_cast<int64_t>(m_config.gap * kScale / 2.0);
 
     out.clear();
     out.resize(rotBank.size());
@@ -253,7 +179,6 @@ double Engine::placeSequential(const Bin &bin,
     // whose NFP is subtracted from the IFP of every new piece.
     const bool hasObstacle = bin.obstacleWidthMm() > 0.0 && bin.obstacleHeightMm() > 0.0;
     Clipper2Lib::Path64 obsPath;       // inflated obstacle, local coords
-    Clipper2Lib::Path64 obsNegOrig;    // negated (uninflated) for NFP
     BBox obsBBoxLocal;
     int64_t obsPx = 0, obsPy = 0;
     if (hasObstacle) {
@@ -267,14 +192,14 @@ double Engine::placeSequential(const Bin &bin,
         obsPx = margin;
         obsPy = margin;
         // Inflate for gap (same as placed pieces)
-        if (halfGap > 0) {
-            auto inflated = Clipper2Lib::InflatePaths({local}, halfGap,
+        if (static_cast<int64_t>(m_config.gap * kScale / 2.0) > 0) {
+            auto inflated = Clipper2Lib::InflatePaths({local},
+                static_cast<int64_t>(m_config.gap * kScale / 2.0),
                 Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
             obsPath = (!inflated.empty()) ? inflated[0] : local;
         } else {
             obsPath = local;
         }
-        obsNegOrig = negatePath(local); // NFP = MinkowskiSum(obsPath, negB) but use uninflated origin
     }
 
     int64_t maxYScaled = hasObstacle
@@ -284,8 +209,8 @@ double Engine::placeSequential(const Bin &bin,
     for (int orderIdx = 0; orderIdx < static_cast<int>(order.size()); ++orderIdx) {
         const int pieceIdx = order[orderIdx];
         const int rIdx     = rotIdx[pieceIdx];
-        const Clipper2Lib::Path64 &B    = rotBank[pieceIdx][rIdx];
-        const BBox bboxB = bboxFromPath(B);
+        const RotGeom &bg  = rotBank[pieceIdx][rIdx];
+        const BBox &bboxB  = bg.bbox;
 
         int64_t ifpX0 = margin - bboxB.xMin;
         int64_t ifpX1 = binW - margin - bboxB.xMax;
@@ -305,9 +230,9 @@ double Engine::placeSequential(const Bin &bin,
             clipper.AddSubject({makeRect(ifpX0, ifpY0, ifpX1, infY)});
 
             for (const auto &p : placed) {
-                const BBox &bboxA = bboxFromPath(rotBank[p.pieceIdx][p.rotIdx]);
+                const RotGeom &ag = rotBank[p.pieceIdx][p.rotIdx];
 
-                if (nfpOutsideIFP(bboxA, bboxB, p.px, p.py, ifpX0, ifpX1, ifpY0))
+                if (nfpOutsideIFP(ag.bbox, bboxB, p.px, p.py, ifpX0, ifpX1, ifpY0))
                     continue;
 
                 const NFPCacheKey key = makeNFPCacheKey(p.pieceIdx, p.rotIdx,
@@ -317,20 +242,10 @@ double Engine::placeSequential(const Bin &bin,
                 if (it != nfpCache.end()) {
                     nfp = &it->second;
                 } else {
-                    // Use full polygon for accurate NFP (concavities can be exploited).
-                    const Clipper2Lib::Path64 &Areal = rotBank[p.pieceIdx][p.rotIdx];
-                    Clipper2Lib::Paths64 Ainflated;
-                    if (halfGap > 0) {
-                        Ainflated = Clipper2Lib::InflatePaths({Areal}, halfGap,
-                            Clipper2Lib::JoinType::Miter,
-                            Clipper2Lib::EndType::Polygon);
-                    }
-                    const Clipper2Lib::Path64 &Aref = halfGap > 0 && !Ainflated.empty()
-                        ? Ainflated[0] : Areal;
-                    Clipper2Lib::Path64 negBreal = negatePath(
-                        rotBank[pieceIdx][rIdx]);
+                    // Full polygon is kept so concavities stay exploitable.
+                    // Aref (inflated A) and negB (negated B) are precomputed.
                     Clipper2Lib::Paths64 nfpResult =
-                        Clipper2Lib::MinkowskiSum(Aref, negBreal, true);
+                        Clipper2Lib::MinkowskiSum(ag.aref, bg.neg, true);
 
                     // Ensure NFP paths are CCW (Clipper2 Difference requires CCW clips).
                     for (auto &np : nfpResult) {
@@ -349,19 +264,29 @@ double Engine::placeSequential(const Bin &bin,
             }
 
             // Subtract obstacle NFP (like a pre-placed piece at margin,margin).
+            // The obstacle NFP only depends on the current (piece, rotation):
+            // cached so it is not recomputed on every placement.
             if (hasObstacle) {
                 const int64_t obsNfpMaxX = obsPx + obsBBoxLocal.xMax - bboxB.xMin;
                 const int64_t obsNfpMinX = obsPx + obsBBoxLocal.xMin - bboxB.xMax;
                 const int64_t obsNfpMaxY = obsPy + obsBBoxLocal.yMax - bboxB.yMin;
                 if (!(obsNfpMaxY <= ifpY0 || obsNfpMaxX <= ifpX0 || obsNfpMinX >= ifpX1)) {
-                    Clipper2Lib::Path64 negB = negatePath(B);
-                    Clipper2Lib::Paths64 nfpObs =
-                        Clipper2Lib::MinkowskiSum(obsPath, negB, true);
-                    for (auto &np : nfpObs) {
-                        if (Clipper2Lib::Area(np) < 0)
-                            std::reverse(np.begin(), np.end());
+                    const NFPCacheKey okey = makeNFPCacheKey(pieceIdx, rIdx, 0, 0);
+                    const Clipper2Lib::Paths64 *nfpObsPtr = nullptr;
+                    auto oit = obstacleCache.find(okey);
+                    if (oit != obstacleCache.end()) {
+                        nfpObsPtr = &oit->second;
+                    } else {
+                        Clipper2Lib::Paths64 nfpObs =
+                            Clipper2Lib::MinkowskiSum(obsPath, bg.neg, true);
+                        for (auto &np : nfpObs) {
+                            if (Clipper2Lib::Area(np) < 0)
+                                std::reverse(np.begin(), np.end());
+                        }
+                        auto [ins, _] = obstacleCache.emplace(okey, std::move(nfpObs));
+                        nfpObsPtr = &ins->second;
                     }
-                    clipper.AddClip(translatePaths(nfpObs, obsPx, obsPy));
+                    clipper.AddClip(translatePaths(*nfpObsPtr, obsPx, obsPy));
                 }
             }
 
@@ -398,9 +323,9 @@ double Engine::placeSequential(const Bin &bin,
 // ── Simulated annealing ──────────────────────────────────────────────────────
 
 void Engine::anneal(const Bin &bin,
-                    const std::vector<std::vector<Clipper2Lib::Path64>> &rotBank,
-                    const std::vector<std::vector<Clipper2Lib::Path64>> &convexRotBank,
+                    const std::vector<std::vector<RotGeom>> &rotBank,
                     NFPCache &nfpCache,
+                    NFPCache &obstacleCache,
                     std::vector<Placement> &best,
                     int64_t infY) const
 {
@@ -417,7 +342,7 @@ void Engine::anneal(const Bin &bin,
         std::vector<std::pair<double, int>> areaIdx;
         areaIdx.reserve(N);
         for (int i = 0; i < N; ++i)
-            areaIdx.emplace_back(Clipper2Lib::Area(rotBank[i][0]), i);
+            areaIdx.emplace_back(Clipper2Lib::Area(rotBank[i][0].path), i);
         std::sort(areaIdx.begin(), areaIdx.end(),
                   [](const auto &a, const auto &b) { return a.first > b.first; });
         for (int i = 0; i < N; ++i)
@@ -425,7 +350,7 @@ void Engine::anneal(const Bin &bin,
     }
 
     std::vector<Placement> current;
-    double bestHeight = placeSequential(bin, rotBank, convexRotBank, nfpCache,
+    double bestHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache,
                                         rotIdx, order, current, infY);
     best = current;
 
@@ -457,7 +382,7 @@ void Engine::anneal(const Bin &bin,
         }
 
         std::vector<Placement> neighbor;
-        double newHeight = placeSequential(bin, rotBank, convexRotBank, nfpCache,
+        double newHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache,
                                            newRot, newOrder, neighbor, infY);
 
         const double delta = newHeight - bestHeight;
@@ -519,32 +444,50 @@ std::vector<Placement> Engine::place(const Bin &bin,
             std::reverse(p.begin(), p.end());
     };
 
-    // Rotation banks:
-    //   rotBank — full-precision paths for placement
-    //   convexRotBank — convex hull of each rotated path, used for MinkowskiSum.
-    //     The convex-hull NFP is a conservative superset of the true NFP,
-    //     so pieces never overlap, but MinkowskiSum is O(N+M) instead of O(NM).
-    std::vector<std::vector<Clipper2Lib::Path64>> rotBank(N);
-    std::vector<std::vector<Clipper2Lib::Path64>> convexRotBank(N);
+    const int64_t halfGap = static_cast<int64_t>(m_config.gap * kScale / 2.0);
+
+    // Rotation bank — one RotGeom per (piece, rotation): the full CCW path and
+    // every geometry that only depends on it (bbox, negated path, gap-inflated
+    // reference). Previously bbox/neg/inflation were recomputed identically on
+    // every placement / NFP cache miss. NFPs still use the full polygon so
+    // concavities stay exploitable.
+    std::vector<std::vector<RotGeom>> rotBank(N);
     for (int i = 0; i < N; ++i) {
         rotBank[i].reserve(numRots);
-        convexRotBank[i].reserve(numRots);
         for (int r = 0; r < numRots; ++r) {
-            Clipper2Lib::Path64 rotated = rotatePath(local[i], r * m_config.rotationStep);
-            ensureCCW(rotated);
-            auto ch = convexHull(rotated);
-            ensureCCW(ch);
-            convexRotBank[i].push_back(std::move(ch));
-            rotBank[i].push_back(std::move(rotated));
+            RotGeom g;
+            g.path = rotatePath(local[i], r * m_config.rotationStep);
+            ensureCCW(g.path);
+            g.bbox = bboxFromPath(g.path);
+            g.neg  = negatePath(g.path);
+            if (halfGap > 0) {
+                auto inflated = Clipper2Lib::InflatePaths({g.path}, halfGap,
+                    Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
+                g.aref = (!inflated.empty()) ? inflated[0] : g.path;
+            } else {
+                g.aref = g.path;
+            }
+            rotBank[i].push_back(std::move(g));
         }
     }
 
     NFPCache nfpCache;
     nfpCache.reserve(std::size_t(N) * numRots * 4);
+    NFPCache obstacleCache; // keyed (piece, rot); obstacle NFP independent of context
+    obstacleCache.reserve(std::size_t(N) * numRots);
 
-    const int64_t infY = computeInfY(rotBank);
+    // Safe height sentinel: sum of piece heights (rotation 0) + 50% margin.
+    int64_t totalH = 0;
+    for (int i = 0; i < N; ++i) {
+        if (rotBank[i].empty())
+            continue;
+        totalH += rotBank[i][0].bbox.yMax - rotBank[i][0].bbox.yMin;
+    }
+    totalH = totalH + totalH / 2;
+    constexpr int64_t kMaxSafe = int64_t(1) << 50;
+    const int64_t infY = totalH > 0 ? totalH : kMaxSafe;
 
     std::vector<Placement> best;
-    anneal(bin, rotBank, convexRotBank, nfpCache, best, infY);
+    anneal(bin, rotBank, nfpCache, obstacleCache, best, infY);
     return best;
 }

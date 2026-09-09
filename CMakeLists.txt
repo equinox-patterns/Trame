@@ -8,7 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_AUTOMOC ON)
 
 # ── Qt 6 ───────────────────────────────────────────────────────────────────
-find_package(Qt6 REQUIRED COMPONENTS Widgets Xml Svg SvgWidgets PrintSupport)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Xml Svg SvgWidgets PrintSupport Concurrent)
 
 # ── Clipper2 ───────────────────────────────────────────────────────────────
 set(CLIPPER2_UTILS OFF CACHE BOOL "" FORCE)
@@ -56,6 +56,7 @@ target_link_libraries(Rabnest PRIVATE
     Qt6::Xml
     Qt6::Svg
     Qt6::PrintSupport
+    Qt6::Concurrent
     Clipper2
     ZLIB::ZLIB
 )
