@@ -69,6 +69,17 @@ public:
     std::vector<Placement> place(const Bin &bin,
                                  const std::vector<Clipper2Lib::Path64> &pieces) const;
 
+    /// Envelope height of a placement result, in the unit of the input polygons
+    /// (the bin margin included).
+    ///
+    /// place() computes this internally to drive the annealing but does not
+    /// return it. Every caller that needs the final height — writers, tests,
+    /// the host application — shares this one implementation instead of
+    /// recomputing the envelope from the placements.
+    static double UsedHeight(const std::vector<Placement> &placements,
+                             const std::vector<Clipper2Lib::Path64> &pieces,
+                             const Bin &bin);
+
 private:
     // ── Precomputed per-(piece, rotation) geometry ───────────────────────
 

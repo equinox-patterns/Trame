@@ -102,3 +102,9 @@ target_link_libraries(svg2pdf PRIVATE
 # arguments, et il n'existe aucun test automatisé dans ce dépôt.
 add_executable(nestbench tests/nestbench.cpp)
 target_link_libraries(nestbench PRIVATE Trame)
+
+# Instrument de mesure — il ne vérifie rien, il chiffre : rejoue un nesting et
+# mesure le dégagement réellement obtenu entre les contours posés, au lieu de
+# le déduire de la lecture du moteur. Voir tests/gapbench.cpp.
+add_executable(gapbench tests/gapbench.cpp)
+target_link_libraries(gapbench PRIVATE Trame)

@@ -191,10 +191,12 @@ double Engine::placeSequential(const Bin &bin,
         obsBBoxLocal = bboxFromPath(local);
         obsPx = margin;
         obsPy = margin;
-        // Inflate for gap (same as placed pieces)
-        if (static_cast<int64_t>(m_config.gap * kScale / 2.0) > 0) {
-            auto inflated = Clipper2Lib::InflatePaths({local},
-                static_cast<int64_t>(m_config.gap * kScale / 2.0),
+        // Inflate by the FULL gap, exactly like the placed pieces below — see
+        // the note on gapRadius. Halving it here would leave the piece only
+        // gap/2 clear of the obstacle, the same defect in a second place.
+        const int64_t obsGap = static_cast<int64_t>(m_config.gap * kScale);
+        if (obsGap > 0) {
+            auto inflated = Clipper2Lib::InflatePaths({local}, obsGap,
                 Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
             obsPath = (!inflated.empty()) ? inflated[0] : local;
         } else {
@@ -444,7 +446,20 @@ std::vector<Placement> Engine::place(const Bin &bin,
             std::reverse(p.begin(), p.end());
     };
 
-    const int64_t halfGap = static_cast<int64_t>(m_config.gap * kScale / 2.0);
+    // The gap is the CLEAR DISTANCE held between two pieces, so the reference is
+    // inflated by the full gap — not by half of it.
+    //
+    // The NFP is MinkowskiSum(A_inflated, -B): it forbids every position where
+    // the inflated A would meet B. Inflating by gap/2 therefore only ever
+    // guaranteed gap/2 on the floor, which is what this code did until the
+    // clearances were actually measured (Trame/tests/gapbench.cpp) — a nesting
+    // asked for 5 mm was delivering 2.5 mm.
+    //
+    // The two-sided scheme (A and B each grown by gap/2) describes the very same
+    // forbidden region, since MinkowskiSum(A⊕g/2, -(B⊕g/2)) equals
+    // MinkowskiSum(A⊕g, -B). One inflation instead of two, for the same
+    // geometry.
+    const int64_t gapRadius = static_cast<int64_t>(m_config.gap * kScale);
 
     // Rotation bank — one RotGeom per (piece, rotation): the full CCW path and
     // every geometry that only depends on it (bbox, negated path, gap-inflated
@@ -460,8 +475,8 @@ std::vector<Placement> Engine::place(const Bin &bin,
             ensureCCW(g.path);
             g.bbox = bboxFromPath(g.path);
             g.neg  = negatePath(g.path);
-            if (halfGap > 0) {
-                auto inflated = Clipper2Lib::InflatePaths({g.path}, halfGap,
+            if (gapRadius > 0) {
+                auto inflated = Clipper2Lib::InflatePaths({g.path}, gapRadius,
                     Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
                 g.aref = (!inflated.empty()) ? inflated[0] : g.path;
             } else {
@@ -490,4 +505,58 @@ std::vector<Placement> Engine::place(const Bin &bin,
     std::vector<Placement> best;
     anneal(bin, rotBank, nfpCache, obstacleCache, best, infY);
     return best;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+double Engine::UsedHeight(const std::vector<Placement> &placements,
+                          const std::vector<Clipper2Lib::Path64> &pieces,
+                          const Bin &bin)
+{
+    double usedHeight = 0.0;
+
+    for (size_t i = 0; i < placements.size() && i < pieces.size(); ++i)
+    {
+        int64_t xMin = (std::numeric_limits<int64_t>::max)();
+        int64_t yMin = (std::numeric_limits<int64_t>::max)();
+        for (const auto &pt : pieces[i])
+        {
+            if (pt.x < xMin) { xMin = pt.x; }
+            if (pt.y < yMin) { yMin = pt.y; }
+        }
+
+        // The engine places the piece by the min-bbox corner of its *unrotated*
+        // polygon, so the envelope is measured from that same origin.
+        Clipper2Lib::Path64 local;
+        local.reserve(pieces[i].size());
+        for (const auto &pt : pieces[i])
+        {
+            local.push_back({pt.x - xMin, pt.y - yMin});
+        }
+
+        int64_t ryMax = (std::numeric_limits<int64_t>::min)();
+        if (placements[i].rotation != 0.0)
+        {
+            const double rad = placements[i].rotation * M_PI / 180.0;
+            const double c   = std::cos(rad);
+            const double s   = std::sin(rad);
+            for (const auto &pt : local)
+            {
+                const auto y = static_cast<int64_t>(std::round(pt.x * s + pt.y * c));
+                if (y > ryMax) { ryMax = y; }
+            }
+        }
+        else
+        {
+            for (const auto &pt : local)
+            {
+                if (pt.y > ryMax) { ryMax = pt.y; }
+            }
+        }
+
+        const double bottom = placements[i].y + static_cast<double>(ryMax) / kScale;
+        if (bottom > usedHeight) { usedHeight = bottom; }
+    }
+
+    // The top margin is already part of the placement area: the IFP starts at y = margin.
+    return usedHeight + bin.marginMm();
 }

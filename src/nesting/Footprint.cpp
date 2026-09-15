@@ -31,9 +31,13 @@ Result compute(const QVector<SizeLayer> &layers)
 
     for (const auto &layer : layers) {
         for (const auto &piece : layer.pieces) {
+            // Group on the group's *identity*, never on its name: nothing enforces
+            // unique group names, and two groups called the same used to be unioned
+            // into one footprint. groupKey is what a caller that has a stable id
+            // passes; the name stays the display name.
             const QString key = piece.groupName.isEmpty()
                 ? piece.name
-                : piece.groupName;  // group all pieces of same group together
+                : (piece.groupKey.isEmpty() ? piece.groupName : piece.groupKey);
 
             Clipper2Lib::Path64 c = piece.contour();
             if (c.empty())

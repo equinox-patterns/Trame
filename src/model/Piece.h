@@ -52,6 +52,13 @@ struct Piece
     // Which group this piece belongs to (empty = standalone)
     QString groupName;
 
+    // Identity of the group, when the caller has one. Group NAMES are not unique —
+    // nothing in the application enforces it — so grouping on the name alone merges
+    // two different groups into a single footprint. Callers that know a stable id
+    // set it here; the name is then only what gets displayed.
+    // Empty falls back to groupName, which is what an SVG reader can offer.
+    QString groupKey;
+
     // Convenience: full contour as a single Path64
     Clipper2Lib::Path64 contour() const;
 };
