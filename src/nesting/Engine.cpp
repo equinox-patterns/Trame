@@ -504,6 +504,14 @@ std::vector<Placement> Engine::place(const Bin &bin,
 
     std::vector<Placement> best;
     anneal(bin, rotBank, nfpCache, obstacleCache, best, infY);
+
+    // The adjustment pass — strictly after the search, never inside it. The
+    // grid is read here and nowhere else: the annealing above runs exactly as
+    // it did before tiling existed, and without a grid this line does nothing.
+    if (m_config.artboardCount > 0 && m_config.artboardHeight > 0.0) {
+        refine(bin, rotBank, best, pieces);
+    }
+
     return best;
 }
 

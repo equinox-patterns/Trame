@@ -37,6 +37,7 @@ set(TRAME_SOURCES
     src/io/SvgReader.cpp
     src/nesting/Bin.cpp
     src/nesting/Engine.cpp
+    src/nesting/EngineRefine.cpp
     src/nesting/Footprint.cpp
     src/pdf/SvgToOcgPdf.cpp
 )

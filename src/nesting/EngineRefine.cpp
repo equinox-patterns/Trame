@@ -1,0 +1,601 @@
+/************************************************************************
+ **
+ **  @file   EngineRefine.cpp
+ **  @author Sophie Denys <contact@sophiedenys.com>
+ **  @date   15/09/2026
+ **
+ **  @brief  Second pass over a decided placement — the tiled adjustment.
+ **
+ **          The nesting engine minimises height, and nothing else. On a tiled
+ **          plan that leaves two things on the table: the dead band the last
+ **          artboard row keeps for free, and the footprint borders that happen
+ **          to run along a cut line.
+ **
+ **  @copyright
+ **  Copyright (C) 2026 Sophie Denys <contact@sophiedenys.com>
+ **  All rights reserved.
+ **
+ *************************************************************************/
+
+#include "nesting/Engine.h"
+
+#include "nesting/Bin.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace
+{
+
+/// How many rounds over every piece before giving up. The loop also stops as
+/// soon as a whole round changes nothing, which is the usual ending.
+constexpr int kMaxRounds = 8;
+
+/// Ceiling on the non-fit polygons this pass may compute. Reusing what the
+/// annealing already paid for is free; computing a missing one is not, and an
+/// unbounded search would answer a printing annoyance with a frozen window.
+constexpr int kMaxNfpComputations = 4000;
+
+using Clipper2Lib::Path64;
+using Clipper2Lib::Paths64;
+using Clipper2Lib::Point64;
+
+BBox BBoxOf(const Path64 &path)
+{
+    BBox b{0, 0, 0, 0};
+    if (path.empty())
+    {
+        return b;
+    }
+
+    b.xMin = b.xMax = path[0].x;
+    b.yMin = b.yMax = path[0].y;
+
+    for (const Point64 &p : path)
+    {
+        b.xMin = std::min(b.xMin, p.x);
+        b.yMin = std::min(b.yMin, p.y);
+        b.xMax = std::max(b.xMax, p.x);
+        b.yMax = std::max(b.yMax, p.y);
+    }
+
+    return b;
+}
+
+/// Point64's two-argument constructor is a template: both arguments must have
+/// the SAME type or deduction fails and the call does not compile. A bare `0`
+/// beside an int64_t is enough to break it, which is why this exists.
+Point64 Delta(int64_t dx, int64_t dy)
+{
+    return Point64(dx, dy);
+}
+
+double PointToSegment(double px, double py, double ax, double ay, double bx, double by)
+{
+    const double dx   = bx - ax;
+    const double dy   = by - ay;
+    const double len2 = dx * dx + dy * dy;
+
+    double t = 0.0;
+    if (len2 > 0.0)
+    {
+        t = std::clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0.0, 1.0);
+    }
+
+    return std::hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+double Cross(double ox, double oy, double ax, double ay, double bx, double by)
+{
+    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+}
+
+/// Distance between two segments — zero when they cross.
+///
+/// Clipper2 has no contour-to-contour distance (nothing there takes two Paths),
+/// so this is written here. It is the same arithmetic as the measuring
+/// instrument in tests/gapbench.cpp, which is where it was checked against a
+/// clearance that was known in advance.
+double SegmentDistance(const Point64 &a1, const Point64 &a2,
+                       const Point64 &b1, const Point64 &b2)
+{
+    const double d1 = Cross(a1.x, a1.y, a2.x, a2.y, b1.x, b1.y);
+    const double d2 = Cross(a1.x, a1.y, a2.x, a2.y, b2.x, b2.y);
+    const double d3 = Cross(b1.x, b1.y, b2.x, b2.y, a1.x, a1.y);
+    const double d4 = Cross(b1.x, b1.y, b2.x, b2.y, a2.x, a2.y);
+
+    const bool cross = ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+                    && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+
+    if (cross)
+    {
+        return 0.0;
+    }
+
+    return std::min({PointToSegment(a1.x, a1.y, b1.x, b1.y, b2.x, b2.y),
+                     PointToSegment(a2.x, a2.y, b1.x, b1.y, b2.x, b2.y),
+                     PointToSegment(b1.x, b1.y, a1.x, a1.y, a2.x, a2.y),
+                     PointToSegment(b2.x, b2.y, a1.x, a1.y, a2.x, a2.y)});
+}
+
+double PathDistance(const Path64 &a, const Path64 &b)
+{
+    double best = std::numeric_limits<double>::max();
+
+    const std::size_t na = a.size();
+    const std::size_t nb = b.size();
+
+    for (std::size_t i = 0; i < na; ++i)
+    {
+        const Point64 &a1 = a[i];
+        const Point64 &a2 = a[(i + 1) % na];
+
+        for (std::size_t j = 0; j < nb; ++j)
+        {
+            const double d = SegmentDistance(a1, a2, b[j], b[(j + 1) % nb]);
+            if (d < best)
+            {
+                best = d;
+
+                if (best <= 0.0)
+                {
+                    return 0.0;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+/// How close a footprint border runs to a cut line — the number that matters.
+///
+/// Crossing a line is NOT the defect: a piece larger than an artboard is cut,
+/// that is what tiling is for. The defect is a BORDER that runs along the line,
+/// either by stopping just short of it or by poking only a hair past it. So a
+/// crossing piece is measured by its **thinnest protrusion**: a piece cut
+/// through the middle has two large ones and is left alone, a piece that pokes
+/// one millimetre past counts.
+double BorderToLine(const Path64 &c, int64_t coord, bool vertical)
+{
+    double minAbs   = std::numeric_limits<double>::max();
+    double maxLeft  = 0.0;
+    double maxRight = 0.0;
+
+    for (const Point64 &p : c)
+    {
+        const double d = static_cast<double>((vertical ? p.x : p.y) - coord);
+
+        minAbs = std::min(minAbs, std::abs(d));
+        if (d <= 0.0) { maxLeft  = std::max(maxLeft, -d); }
+        if (d >= 0.0) { maxRight = std::max(maxRight,  d); }
+    }
+
+    const bool crosses = (maxLeft > 0.0 && maxRight > 0.0);
+    return crosses ? std::min(maxLeft, maxRight) : minAbs;
+}
+
+} // namespace
+
+//---------------------------------------------------------------------------------------------------------------------
+void Engine::refine(const Bin &bin,
+                    const std::vector<std::vector<RotGeom>> &rotBank,
+                    std::vector<Placement> &best,
+                    const std::vector<Clipper2Lib::Path64> &pieces) const
+{
+    const std::size_t n = best.size();
+
+    // Nothing to adjust with a single piece, and nothing trustworthy to adjust
+    // if the first pass did not place them all. UsedHeight would happily fold a
+    // phantom at (0, 0) into the envelope, and the pass would then optimise a
+    // plan that does not exist.
+    if (n < 2 || pieces.size() != n)
+    {
+        return;
+    }
+    for (const Placement &p : best)
+    {
+        if (p.rotation < 0.0)
+        {
+            return;
+        }
+    }
+
+    // The obstacle geometry lives inside placeSequential and is not reachable
+    // here. No Ostara run sets one, so this costs nothing today — and refusing
+    // is the only honest option rather than guessing where the obstacle is.
+    if (bin.obstacleWidthMm() > 0.0 || bin.obstacleHeightMm() > 0.0)
+    {
+        return;
+    }
+
+    const int64_t binW   = static_cast<int64_t>(bin.widthMm() * kScale);
+    const int64_t margin = static_cast<int64_t>(bin.marginMm() * kScale);
+    const int64_t gapR   = static_cast<int64_t>(m_config.gap * kScale);
+    const int64_t cellW  = binW / m_config.artboardCount;
+    const int64_t cellH  = static_cast<int64_t>(m_config.artboardHeight * kScale);
+
+    if (cellW <= 0 || cellH <= 0)
+    {
+        return;
+    }
+
+    // The envelope comes from the very number Ostara stores and turns into a
+    // page count — never from a local recomputation, which would drift.
+    const int64_t used     = static_cast<int64_t>(UsedHeight(best, pieces, bin) * kScale);
+    const int     rows     = std::max(1, static_cast<int>(std::ceil(
+                                 static_cast<double>(used) / static_cast<double>(cellH) - 1e-9)));
+    const int64_t envelope = static_cast<int64_t>(rows) * cellH;
+
+    // One engine unit past the tolerance, so that "clear" stays clear once the
+    // rounded integer coordinates are converted back. Aiming exactly at the gap
+    // leaves the border a fraction of a nanometre inside it, which the measure
+    // then reports as still grazing — true, and useless.
+    const int64_t clear = gapR + 1;
+
+    // The upper end of the envelope is knife-edge: Ostara recomputes the row
+    // count as ceil(height / cellHeight - 1e-9), so a height landing exactly on
+    // rows*cellHeight sits one rounding away from counting a whole extra row —
+    // a printed sheet nobody asked for. Every candidate aims at the envelope
+    // MINUS this guard, never at the brim, so the pass can still use the dead
+    // band without ever touching the edge.
+    const int64_t guard = cellH / 1000;
+
+    std::vector<int64_t> vLines;
+    std::vector<int64_t> hLines;
+    for (int k = 1; k < m_config.artboardCount; ++k) { vLines.push_back(cellW * k); }
+    for (int j = 1; j < rows; ++j)                   { hLines.push_back(cellH * j); }
+
+    if (vLines.empty() && hLines.empty())
+    {
+        return;
+    }
+
+    std::vector<int>     rIdx(n, 0);
+    std::vector<Point64> pos(n);
+
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const int r = static_cast<int>(std::llround(best[i].rotation / m_config.rotationStep));
+        if (r < 0 || static_cast<std::size_t>(r) >= rotBank[i].size())
+        {
+            return;
+        }
+
+        rIdx[i] = r;
+        pos[i]  = {static_cast<int64_t>(std::llround(best[i].x * kScale)),
+                   static_cast<int64_t>(std::llround(best[i].y * kScale))};
+    }
+
+    // ── Geometry at a hypothetical set of positions ───────────────────────
+
+    auto contourAt = [&](std::size_t i, const Point64 &p) -> Path64
+    {
+        return Clipper2Lib::TranslatePath(rotBank[i][rIdx[i]].path, p.x, p.y);
+    };
+
+    // ── The one test that decides whether a position is allowed ───────────
+    //
+    // It is NOT a distance. Two outlines can be far apart while one of them
+    // sits entirely INSIDE the other — the distance between outlines is then
+    // perfectly healthy, and the pieces are on top of each other. That is how a
+    // cuff was first dropped inside its own sleeve: everything the earlier
+    // version measured was fine, and the result was two pieces in one place.
+    //
+    // So the question asked is the right one: does the reference piece, grown by
+    // the full gap, meet the other piece at all. `aref` is exactly that grown
+    // outline — the engine computed it for the first pass, so this costs no
+    // inflation here. Containment is caught, since a piece inside another still
+    // intersects it.
+    auto tooClose = [&](std::size_t a, const Point64 &pa,
+                        std::size_t b, const Point64 &pb) -> bool
+    {
+        const Paths64 grown = Clipper2Lib::TranslatePaths({rotBank[a][rIdx[a]].aref}, pa.x, pa.y);
+        const Paths64 other = Clipper2Lib::TranslatePaths({rotBank[b][rIdx[b]].path}, pb.x, pb.y);
+
+        return !Clipper2Lib::Intersect(grown, other, Clipper2Lib::FillRule::NonZero).empty();
+    };
+
+    // Borders running along a cut line, summed over every piece. Cheap: a walk
+    // over the vertices, once per line.
+    auto grazingTotal = [&](const std::vector<Point64> &p) -> int
+    {
+        int g = 0;
+
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const Path64 c = contourAt(i, p[i]);
+
+            for (const int64_t line : vLines) { g += (BorderToLine(c, line, true)  < static_cast<double>(gapR)) ? 1 : 0; }
+            for (const int64_t line : hLines) { g += (BorderToLine(c, line, false) < static_cast<double>(gapR)) ? 1 : 0; }
+        }
+
+        return g;
+    };
+
+    // Smallest gap anywhere in the plan — what the second objective widens. It
+    // is the bottleneck, not the average: raising the tightest cut is what makes
+    // the sheet easier to work with, and a bottleneck cannot be bought by
+    // loosening one gap while squeezing another.
+    auto minClearance = [&](const std::vector<Point64> &p) -> double
+    {
+        double best = std::numeric_limits<double>::max();
+
+        for (std::size_t a = 0; a < n; ++a)
+        {
+            for (std::size_t b = a + 1; b < n; ++b)
+            {
+                best = std::min(best, PathDistance(contourAt(a, p[a]), contourAt(b, p[b])));
+            }
+        }
+
+        return best;
+    };
+
+    // ── A move is a BLOCK, not a piece ────────────────────────────────────
+    //
+    // Moving one piece alone almost never helps: the pieces sit at exactly the
+    // gap, so pushing one into its neighbour is a collision, not a move. What a
+    // hand does — and what Sophie described — is push the neighbour along. A
+    // block translated as a whole keeps every gap inside it, so only the leading
+    // edge has anything new to answer for.
+    //
+    // Returns the resulting positions, and an empty vector when the move is
+    // refused. Nothing is ever written before it is known to hold.
+
+    auto pushBlock = [&](std::size_t i, const Point64 &delta) -> std::vector<Point64>
+    {
+        std::vector<Point64> out = pos;
+        std::vector<bool>    taken(n, false);
+
+        std::vector<std::size_t> queue{i};
+        std::vector<std::size_t> block{i};
+        taken[i] = true;
+
+        while (!queue.empty())
+        {
+            const std::size_t k = queue.back();
+            queue.pop_back();
+
+            out[k] = {pos[k].x + delta.x, pos[k].y + delta.y};
+
+            for (std::size_t j = 0; j < n; ++j)
+            {
+                if (taken[j])
+                {
+                    continue;
+                }
+
+                if (tooClose(k, out[k], j, pos[j]))
+                {
+                    taken[j] = true;
+                    block.push_back(j);
+                    queue.push_back(j);
+                }
+            }
+        }
+
+        // Everything the block touched must stay in the bin, and must not have
+        // been driven into a piece left behind.
+        for (const std::size_t k : block)
+        {
+            const BBox &g = rotBank[k][rIdx[k]].bbox;
+
+            if (out[k].x + g.xMin < margin || out[k].x + g.xMax > binW - margin)
+            {
+                return {};
+            }
+            if (out[k].y + g.yMin < margin)
+            {
+                return {};
+            }
+        }
+
+        for (const std::size_t k : block)
+        {
+            for (std::size_t j = 0; j < n; ++j)
+            {
+                if (taken[j])
+                {
+                    continue;
+                }
+
+                if (tooClose(k, out[k], j, pos[j]))
+                {
+                    return {};
+                }
+            }
+        }
+
+        // Height. Ostara recomputes the row count from whatever height this pass
+        // leaves behind, so crossing a row boundary — either way — adds or drops
+        // a printed sheet. The envelope is an interval, not a ceiling.
+        int64_t newUsed = 0;
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            newUsed = std::max(newUsed, out[j].y + rotBank[j][rIdx[j]].bbox.yMax);
+        }
+        newUsed += margin;
+
+        if (newUsed > (envelope - guard) || newUsed <= (envelope - cellH))
+        {
+            return {};
+        }
+
+        return out;
+    };
+
+    // ── Rounds ────────────────────────────────────────────────────────────
+
+    for (int round = 0; round < kMaxRounds; ++round)
+    {
+        bool moved = false;
+
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const int g0 = grazingTotal(pos);
+
+            const int savedR  = rIdx[i];
+            const int numRots = static_cast<int>(rotBank[i].size());
+            const int quarter = std::max(1, static_cast<int>(std::lround(90.0 / m_config.rotationStep)));
+
+            int                  bestG   = g0;
+            double               bestC   = 0.0;
+            bool                 haveC   = false;
+            std::vector<Point64> bestPos = pos;
+            int                  bestR   = savedR;
+            bool                 found   = false;
+
+            // ── Les orientations essayées ──────────────────────────────────
+            //
+            // La banque porte DÉJÀ toutes les rotations de chaque pièce — le
+            // recuit les a fait construire — donc essayer un quart de tour ne
+            // coûte aucune géométrie, seulement les tests. Les pas intermédiaires
+            // n'apporteraient rien ici : ce que la rotation change, c'est
+            // l'appartenance à un cadre, donc l'axe. Une pièce posée de travers
+            // dans une grille droite ne gagne rien à pencher un peu plus.
+            for (const int offset : {0, quarter, -quarter, 2 * quarter})
+            {
+                if (numRots <= 0)
+                {
+                    break;
+                }
+
+                int r = (savedR + offset) % numRots;
+                if (r < 0)
+                {
+                    r += numRots;
+                }
+
+                rIdx[i] = r;
+                const BBox &g = rotBank[i][r].bbox;
+
+                // Quatre façons de passer une ligne de coupe, par ligne : dégagé
+                // d'un côté, dégagé de l'autre, ou à cheval avec le bord le plus
+                // proche exactement au jeu. Les deux dernières sont ce qui répare
+                // vraiment une pièce qui dépasse d'un cheveu — les interdire
+                // était le défaut entier de la première version.
+                std::vector<Point64> deltas;
+                deltas.reserve(4 * (vLines.size() + hLines.size()) + 8);
+
+                for (const int64_t line : vLines)
+                {
+                    deltas.push_back(Delta((line - clear - g.xMax) - pos[i].x, 0));
+                    deltas.push_back(Delta((line + clear - g.xMin) - pos[i].x, 0));
+                    deltas.push_back(Delta((line + clear - g.xMax) - pos[i].x, 0));
+                    deltas.push_back(Delta((line - clear - g.xMin) - pos[i].x, 0));
+                }
+                for (const int64_t line : hLines)
+                {
+                    deltas.push_back(Delta(0, (line - clear - g.yMax) - pos[i].y));
+                    deltas.push_back(Delta(0, (line + clear - g.yMin) - pos[i].y));
+                    deltas.push_back(Delta(0, (line + clear - g.yMax) - pos[i].y));
+                    deltas.push_back(Delta(0, (line - clear - g.yMin) - pos[i].y));
+                }
+
+                // ── Les déplacements qui desserrent vraiment ───────────────
+                //
+                // Une pichenette de 5 mm ne sépare rien quand le voisin est à
+                // 5 mm : elle le pousse, et un bloc poussé garde ses écarts
+                // intacts. Pour élargir le point le plus étroit il faut aller
+                // franchement quelque part — aussi loin que l'enveloppe et le
+                // bin le permettent, dans chacune des quatre directions. C'est la
+                // pièce du bas qui gagne : elle descend dans la bande morte sans
+                // rien pousser.
+                //
+                // Les deux autres directions sont refusées par la borne basse de
+                // l'enveloppe dès qu'elles feraient perdre une rangée, et c'est
+                // exactement ce qu'on veut : elles ne coûtent qu'un essai.
+                deltas.push_back(Delta(0, (envelope - guard - margin - g.yMax) - pos[i].y));
+                deltas.push_back(Delta(0, (margin - g.yMin) - pos[i].y));
+                deltas.push_back(Delta((binW - margin - g.xMax) - pos[i].x, 0));
+                deltas.push_back(Delta((margin - g.xMin) - pos[i].x, 0));
+
+                // Et deux pichenettes, qui suffisent quand la place est juste.
+                deltas.push_back(Delta(0, gapR));
+                deltas.push_back(Delta(gapR, 0));
+
+                for (const Point64 &delta : deltas)
+                {
+                    if (delta.x == 0 && delta.y == 0)
+                    {
+                        continue;
+                    }
+
+                    const std::vector<Point64> candidate = pushBlock(i, delta);
+                    if (candidate.empty())
+                    {
+                        continue;
+                    }
+
+                    const int g1 = grazingTotal(candidate);
+
+                    // Lexicographic, and that order is the whole point: a cut
+                    // line freed always wins. Pieces are never pushed into a
+                    // line to be pulled apart — the second objective waits.
+                    if (g1 < bestG)
+                    {
+                        bestG   = g1;
+                        bestPos = candidate;
+                        bestR   = r;
+                        found   = true;
+                        haveC   = false; // le meilleur a bougé : dégagement à relire
+                        continue;
+                    }
+
+                    if (g1 > bestG)
+                    {
+                        continue;
+                    }
+
+                    // À égalité sur les lignes, c'est le desserrage qui tranche.
+                    if (!haveC)
+                    {
+                        // Le meilleur connu peut venir d'une AUTRE orientation :
+                        // son dégagement doit être relu dans celle-là, pas dans
+                        // celle qu'on est en train d'essayer.
+                        const int keep = rIdx[i];
+                        rIdx[i] = bestR;
+                        bestC = minClearance(bestPos);
+                        rIdx[i] = keep;
+                        haveC = true;
+                    }
+
+                    const double c1 = minClearance(candidate);
+                    if (c1 > bestC)
+                    {
+                        bestC   = c1;
+                        bestPos = candidate;
+                        bestR   = r;
+                        found   = true;
+                    }
+                }
+            }
+
+            if (!found)
+            {
+                rIdx[i] = savedR; // rien retenu : la pièce garde son orientation
+                continue;
+            }
+
+            rIdx[i] = bestR;
+            best[i].rotation = static_cast<double>(bestR) * m_config.rotationStep;
+
+            for (std::size_t j = 0; j < n; ++j)
+            {
+                pos[j]    = bestPos[j];
+                best[j].x = static_cast<double>(pos[j].x) / kScale;
+                best[j].y = static_cast<double>(pos[j].y) / kScale;
+            }
+            moved = true;
+        }
+
+        if (!moved)
+        {
+            break;
+        }
+    }
+}

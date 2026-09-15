@@ -15,7 +15,13 @@
  **          dégagement mesuré double quand le jeu demandé double, le facteur
  **          est confirmé.
  **
- **  Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm>
+ **  Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm> [colonnes hauteur_cadre_mm]
+ **
+ **          Sans les deux derniers arguments, l'instrument ne mesure que le jeu.
+ **          Avec eux, il construit la grille des cadres — exactement comme
+ **          Ostara la construit — et compte les bords d'empreinte trop proches
+ **          d'une ligne de coupe. La tolérance est le jeu lui-même : c'est la
+ **          décision de Sophie du 15-09-2026.
  **
  **  @copyright
  **  Copyright (C) 2026 Sophie Denys <contact@sophiedenys.com>
@@ -200,6 +206,50 @@ double ContourDistance(const Path64 &a, const Path64 &b)
     return best;
 }
 
+/// Proximité d'un contour à une ligne de coupe — le nombre qui compte vraiment.
+struct LineGap
+{
+    double proximity;  ///< distance du BORD de la pièce à la ligne
+    bool   crosses;    ///< la ligne traverse-t-elle la pièce ?
+};
+
+/// **Franchir une ligne n'est pas le problème.** Une pièce plus grande qu'un
+/// cadre est coupée : c'est le principe du tuilage, et c'est attendu.
+///
+/// Le problème est qu'un BORD de pièce longe la ligne — soit qu'il s'en approche
+/// sans la franchir, soit qu'il ne la dépasse que d'un cheveu. Dans les deux cas
+/// le trait de coupe et le contour se confondent, et la découpe abîme la pièce.
+///
+/// D'où la mesure. Si le contour ne franchit pas la droite : la distance
+/// ordinaire. S'il la franchit : **la plus petite des deux saillies** — de
+/// combien la pièce dépasse du côté le plus mince. Une pièce coupée en plein
+/// milieu a deux grandes saillies et ne compte pas ; une pièce qui dépasse d'un
+/// millimètre compte, et c'est exactement le cas du `Devant` sur le bord droit.
+///
+/// Compter les franchissements confondait ces deux situations opposées, et
+/// noyait le seul cas qui compte sous les dix inévitables.
+LineGap ContourToLine(const Path64 &c, int64_t coord, bool vertical)
+{
+    double minAbs   = std::numeric_limits<double>::max();
+    double maxLeft  = 0.0;
+    double maxRight = 0.0;
+
+    for (const Point64 &p : c)
+    {
+        const double d = static_cast<double>((vertical ? p.x : p.y) - coord);
+
+        minAbs = std::min(minAbs, std::abs(d));
+        if (d <= 0.0) { maxLeft  = std::max(maxLeft, -d); }
+        if (d >= 0.0) { maxRight = std::max(maxRight,  d); }
+    }
+
+    LineGap g;
+    g.crosses   = (maxLeft > 0.0 && maxRight > 0.0);
+    g.proximity = g.crosses ? std::min(maxLeft, maxRight) : minAbs;
+
+    return g;
+}
+
 /// Écart entre deux boîtes — minorant de la distance des contours, donc un
 /// filtre sûr pour écarter les paires lointaines avant le calcul exact.
 double BBoxGap(const BBox &a, const BBox &b)
@@ -221,15 +271,22 @@ int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
-    if (argc != 4)
+    if (argc != 4 && argc != 6 && argc != 7)
     {
-        std::fprintf(stderr, "Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm>\n");
+        std::fprintf(stderr,
+                     "Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm>"
+                     " [colonnes hauteur_cadre_mm [raffiner]]\n"
+                     "        raffiner = 0 mesure la grille SANS lancer la passe 2 :\n"
+                     "        c'est le « avant » reproductible.\n");
         return 2;
     }
 
-    const QString inputPath  = QString::fromLocal8Bit(argv[1]);
-    const double  binWidthMm = QString::fromLocal8Bit(argv[2]).toDouble();
-    const double  gapMm      = QString::fromLocal8Bit(argv[3]).toDouble();
+    const QString inputPath     = QString::fromLocal8Bit(argv[1]);
+    const double  binWidthMm    = QString::fromLocal8Bit(argv[2]).toDouble();
+    const double  gapMm         = QString::fromLocal8Bit(argv[3]).toDouble();
+    const int     columns       = (argc >= 6) ? QString::fromLocal8Bit(argv[4]).toInt() : 0;
+    const double  frameHeightMm = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toDouble() : 0.0;
+    const bool    refineWanted  = (argc < 7) || (QString::fromLocal8Bit(argv[6]) != QLatin1String("0"));
 
     if (binWidthMm <= 0.0 || gapMm < 0.0)
     {
@@ -263,6 +320,16 @@ int main(int argc, char *argv[])
 
     Engine::Config cfg;
     cfg.gap = gapMm * kMmToPx;
+
+    // La grille n'entre dans le moteur que si elle est demandée ET si la passe 2
+    // doit tourner : c'est ce qui rend le « avant » reproductible, et c'est aussi
+    // la démonstration que le recuit lui-même ne la voit jamais.
+    if (columns >= 1 && frameHeightMm > 0.0 && refineWanted)
+    {
+        cfg.artboardCount  = columns;
+        cfg.artboardHeight = frameHeightMm * kMmToPx;
+    }
+
     Engine engine(cfg);
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -365,6 +432,32 @@ int main(int argc, char *argv[])
         }
     }
 
+    // ── 4b. Chevauchements ────────────────────────────────────────────────
+    //
+    // Une distance entre CONTOURS ne voit pas qu'une piece est dans une autre :
+    // les contours sont loin l'un de l'autre, les surfaces sont au meme endroit.
+    // C'est ce trou qui a laisse un poignet se poser dans sa manche — ce
+    // compteur teste les SURFACES, et il doit valoir zero.
+    {
+        int overlapping = 0;
+
+        for (std::size_t i = 0; i < contours.size(); ++i)
+        {
+            for (std::size_t j = i + 1; j < contours.size(); ++j)
+            {
+                const Clipper2Lib::Paths64 hit =
+                    Clipper2Lib::Intersect({contours[i]}, {contours[j]},
+                                           Clipper2Lib::FillRule::NonZero);
+                if (!hit.empty())
+                {
+                    ++overlapping;
+                }
+            }
+        }
+
+        std::printf("paires en chevauchement : %6d   (doit valoir 0)\n", overlapping);
+    }
+
     // ── 5. Dégagement au bord du bin ──────────────────────────────────────
     // Le bin est une bande : deux bords verticaux (x = 0 et x = largeur) et un
     // bord haut (y = 0). Pour une droite, la distance minimale d'un segment est
@@ -387,6 +480,100 @@ int main(int argc, char *argv[])
 
         std::printf("degagement mini au bin : gauche %.3f  droite %.3f  haut %.3f mm\n",
                     left * kToMm, right * kToMm, top * kToMm);
+    }
+
+    // ── 6. Les lignes de coupe ────────────────────────────────────────────
+    //
+    // La grille est construite comme Ostara la construit (OExportArtboards::
+    // Compute) : les rangees viennent de la hauteur UTILISEE, et seules les
+    // lignes INTERIEURES sont des lignes de coupe sans marge. Les bords du plan
+    // sont deja tenus par la marge du bin — le relevé plus haut le montre.
+    //
+    // La hauteur vient de Engine::UsedHeight, jamais d'une valeur locale : c'est
+    // le chiffre meme qu'Ostara stocke, donc celui qui decide du nombre de pages.
+    if (columns >= 1 && frameHeightMm > 0.0 && !contours.empty())
+    {
+        const double  kMmToEngine = kMmToPx * kScale;
+        const int64_t cellW       = static_cast<int64_t>(std::llround(binWidthPx * kScale / columns));
+        const int64_t cellH       = static_cast<int64_t>(std::llround(frameHeightMm * kMmToEngine));
+        const int64_t tolerance   = static_cast<int64_t>(std::llround(gapMm * kMmToEngine));
+
+        const double  usedPx     = Engine::UsedHeight(placements, fp.polygons, bin);
+        const int64_t usedEngine = static_cast<int64_t>(std::llround(usedPx * kScale));
+
+        int rows = 0;
+        if (cellH > 0)
+        {
+            rows = std::max(1, static_cast<int>(
+                std::ceil(static_cast<double>(usedEngine) / static_cast<double>(cellH) - 1e-9)));
+        }
+
+        int    grazing   = 0;
+        int    crossed   = 0;
+        double worstLine = std::numeric_limits<double>::max();
+
+        for (const Path64 &c : contours)
+        {
+            for (int k = 1; k < columns; ++k)
+            {
+                const LineGap g = ContourToLine(c, cellW * k, true);
+                grazing  += (g.proximity < static_cast<double>(tolerance)) ? 1 : 0;
+                crossed  += g.crosses ? 1 : 0;
+                worstLine = std::min(worstLine, g.proximity);
+            }
+
+            for (int j = 1; j < rows; ++j)
+            {
+                const LineGap g = ContourToLine(c, cellH * j, false);
+                grazing  += (g.proximity < static_cast<double>(tolerance)) ? 1 : 0;
+                crossed  += g.crosses ? 1 : 0;
+                worstLine = std::min(worstLine, g.proximity);
+            }
+        }
+
+        // Le minimum incompressible. Un contour qui atteint xMin et xMax traverse
+        // TOUTE ligne verticale strictement comprise entre les deux — une courbe
+        // fermée et continue ne peut pas sauter par-dessus. Le nombre de lignes
+        // d'un intervalle de largeur W ne peut pas descendre sous ceil(W/pas) - 1,
+        // et ce plancher ne dépend que de la TAILLE de la pièce, pas de l'endroit
+        // où elle est posée. Si le compte mesuré égale ce plancher, aucun
+        // ajustement ne peut retirer un seul franchissement.
+        int minCrossings = 0;
+
+        for (const BBox &b : boxes)
+        {
+            const double w = static_cast<double>(b.xMax - b.xMin);
+            const double h = static_cast<double>(b.yMax - b.yMin);
+
+            if (cellW > 0)
+            {
+                minCrossings += std::max(0, static_cast<int>(std::ceil(w / cellW)) - 1);
+            }
+            if (cellH > 0)
+            {
+                minCrossings += std::max(0, static_cast<int>(std::ceil(h / cellH)) - 1);
+            }
+        }
+
+        const double envelopeMm = rows * frameHeightMm;
+        const double usedMm     = usedPx / kMmToPx;
+
+        std::printf("grille                 : %d colonnes x %d rangees (cadre %.1f mm)\n",
+                    columns, rows, frameHeightMm);
+        std::printf("hauteur                : utilisee %.3f mm   enveloppe %.3f mm"
+                    "   bande morte %.3f mm\n",
+                    usedMm, envelopeMm, envelopeMm - usedMm);
+        std::printf("lignes de coupe        : %d verticales + %d horizontales\n",
+                    std::max(0, columns - 1), std::max(0, rows - 1));
+        std::printf("BORDS longeant une ligne : %6d   (a moins de %.1f mm)\n",
+                    grazing, gapMm);
+        std::printf("   dont franchissements   : %6d   (dont %d incompressibles"
+                    " — la taille de la piece, pas son placement)\n",
+                    crossed, minCrossings);
+        if (worstLine < std::numeric_limits<double>::max())
+        {
+            std::printf("bord le plus proche d'une ligne : %6.3f mm\n", worstLine * kToMm);
+        }
     }
 
     std::printf("duree                  : %8.3f s\n",
