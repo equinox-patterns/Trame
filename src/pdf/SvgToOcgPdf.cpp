@@ -23,6 +23,7 @@
 #include <QFontMetrics>
 #include <QPageSize>
 #include <QPainter>
+#include <QDateTime>
 #include <QPainterPath>
 #include <QPdfWriter>
 #include <QSvgRenderer>
@@ -38,6 +39,36 @@
 static constexpr double kPointsPerMm = 72.0 / 25.4;  // 1 mm = 2.8346 pt
 static constexpr double kPixelsPerMm = 96.0 / 25.4;  // 1 mm = 3.7795 px @ 96 DPI
 static constexpr double kPixelToPt   = 72.0 / 96.0;   // SVG pixel → PDF points
+
+/// An OCG name, written as a PDF text string.
+///
+/// A literal string is read as PDFDocEncoding, so anything above ASCII comes out
+/// mangled — and these names are the user's, typed in her own language. The format
+/// provides a UTF-16BE hex string for exactly that case, BOM included.
+static QByteArray pdfTextString(const QString &text)
+{
+    bool ascii = true;
+    for (const QChar &ch : text) {
+        if (ch.unicode() < 0x20 || ch.unicode() > 0x7E) {
+            ascii = false;
+            break;
+        }
+    }
+
+    if (!ascii) {
+        QByteArray hex("FEFF");
+        for (const QChar &ch : text)
+            hex += QByteArray::number(static_cast<uint>(ch.unicode()), 16)
+                       .rightJustified(4, '0').toUpper();
+        return '<' + hex + '>';
+    }
+
+    QByteArray literal = text.toLatin1();
+    literal.replace('\\', "\\\\");
+    literal.replace('(', "\\(");
+    literal.replace(')', "\\)");
+    return '(' + literal + ')';
+}
 
 // ── 2D affine transform ───────────────────────────────────────────────────
 
@@ -204,41 +235,62 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath)
+bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info)
 {
     QFile svgFile(svgPath);
     if (!svgFile.open(QIODevice::ReadOnly)) {
         qWarning() << "SvgToOcgPdf: cannot open" << svgPath;
         return false;
     }
+    const QByteArray svgData = svgFile.readAll();
+    svgFile.close();
 
     QDomDocument doc;
     QString errorMsg;
     int errorLine, errorCol;
-    if (!doc.setContent(&svgFile, &errorMsg, &errorLine, &errorCol)) {
+    if (!doc.setContent(svgData, &errorMsg, &errorLine, &errorCol)) {
         qWarning() << "SvgToOcgPdf: XML parse error at line" << errorLine
                    << ":" << errorMsg;
-        svgFile.close();
         return false;
     }
-    svgFile.close();
 
     const PageInfo page = getPageInfo(doc);
     const QVector<LayerEntry> layers = findLayers(doc);
 
+    // No layer group at all: a single-size document. It is still owed a PDF — one plain
+    // content stream and no optional content, since there is nothing to switch on and
+    // off. Refusing it would have left the commonest case with no export at all.
     if (layers.isEmpty()) {
-        qWarning() << "SvgToOcgPdf: no layers found";
-        return false;
+        qWarning() << "SvgToOcgPdf: no layer group, writing a flat PDF";
+
+        const QByteArray pdfBuf = renderToPdfBuffer(svgData, page);
+        if (pdfBuf.isEmpty()) {
+            qWarning() << "SvgToOcgPdf: failed to render the document";
+            return false;
+        }
+
+        const QByteArray stream = extractContentStream(pdfBuf);
+        if (stream.isEmpty()) {
+            qWarning() << "SvgToOcgPdf: failed to extract the content stream";
+            return false;
+        }
+
+        LayerContent whole;
+        whole.name = QStringLiteral("Document");
+        whole.stream = stream;
+        whole.plain = true;
+
+        return buildOcgPdf(pdfPath, page, {whole}, info);
     }
 
-    qWarning() << "Found" << layers.size() << "layers, page"
+    qDebug() << "Found" << layers.size() << "layers, page"
                << page.sizeMm.width() << "x" << page.sizeMm.height() << "mm";
 
     QVector<LayerContent> contents;
     contents.reserve(layers.size());
 
     for (const auto &layer : layers) {
-        qWarning() << "  Rendering layer:" << layer.name;
+        qDebug() << "  Rendering layer:" << layer.name;
 
         const QByteArray layerSvg = buildLayerSvg(doc, layer.element, page);
         const QByteArray pdfBuf = renderToPdfBuffer(layerSvg, page);
@@ -247,13 +299,11 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath)
             continue;
         }
 
-        QByteArray stream = extractContentStream(pdfBuf);
+        const QByteArray stream = extractContentStream(pdfBuf);
         if (stream.isEmpty()) {
             qWarning() << "  Failed to extract stream for layer:" << layer.name;
             continue;
         }
-
-        stream = decompressFlate(stream);
 
         QByteArray textStream;
         // For MEP layer, generate text as PDF path operators
@@ -263,7 +313,7 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath)
             textStream = emitMepTextAsPdfOps(layer.element, pageHeightPt);
         }
 
-        contents.append({layer.name, layer.isMep, stream, textStream});
+        contents.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
     }
 
     if (contents.isEmpty()) {
@@ -271,7 +321,7 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath)
         return false;
     }
 
-    return buildOcgPdf(pdfPath, page, contents);
+    return buildOcgPdf(pdfPath, page, contents, info);
 }
 
 // ── Private methods ───────────────────────────────────────────────────────
@@ -294,14 +344,38 @@ QVector<SvgToOcgPdf::LayerEntry> SvgToOcgPdf::findLayers(const QDomDocument &doc
         if (!hasAiLayer && !hasInkscapeLayer)
             continue;
 
-        const bool isMep = id.contains(QStringLiteral("Mise"), Qt::CaseInsensitive)
-                        || id.contains(QStringLiteral("en_page"), Qt::CaseInsensitive);
+        // The decor layer says so itself. It used to be recognised by its name — it had
+        // to contain "Mise" or "en_page" — which could only work while the name was
+        // imposed. It is not: the user types it in the size range dialog. The marker
+        // exists for that, and a layer renamed in her own words is still the decor.
+        const bool isMep = el.attribute(QStringLiteral("ostara:layout")) == QStringLiteral("yes");
 
-        result.append({id, isMep, el});
-        qWarning() << "  Layer:" << id << (isMep ? "(MEP)" : "");
+        LayerEntry entry;
+        // The id addresses the layer inside the PDF, so it has to be a name whatever the
+        // writer gave us.
+        entry.name = id.isEmpty() ? QStringLiteral("layer_%1").arg(result.size()) : id;
+        entry.displayName = displayNameOf(el);
+        entry.isMep = isMep;
+        entry.element = el;
+
+        result.append(entry);
+        qDebug() << "  Layer:" << entry.name << (isMep ? "(decor)" : "");
     }
 
     return result;
+}
+
+QString SvgToOcgPdf::displayNameOf(const QDomElement &element)
+{
+    const QString label = element.attribute(QStringLiteral("inkscape:label")).trimmed();
+    if (!label.isEmpty())
+        return label;
+
+    const QString title = element.firstChildElement(QStringLiteral("title")).text().trimmed();
+    if (!title.isEmpty())
+        return title;
+
+    return element.attribute(QStringLiteral("id"));
 }
 
 SvgToOcgPdf::PageInfo SvgToOcgPdf::getPageInfo(const QDomDocument &doc) const
@@ -412,53 +486,160 @@ QByteArray SvgToOcgPdf::renderToPdfBuffer(const QByteArray &svgData,
     return buffer.data();
 }
 
+namespace
+{
+/// @brief The /Length an object declares for its stream, or -1 when it declares none.
+///
+/// The value is often an indirect reference — /Length 12 0 R — in which case the number is
+/// read from the object it names. Guessing the length from where "endstream" happens to sit
+/// is what this replaces: the last byte of compressed data is as likely to be a space as
+/// any other, and a whitespace trim ate one whenever it was.
+auto DeclaredStreamLength(const QByteArray &pdfBuf, const QByteArray &objectHeader) -> int
+{
+    const QByteArray marker = "/Length";
+    int cursor = objectHeader.indexOf(marker);
+    if (cursor < 0)
+        return -1;
+
+    cursor += static_cast<int>(marker.size());
+    while (cursor < objectHeader.size() && objectHeader[cursor] == ' ')
+        ++cursor;
+
+    int value = 0;
+    bool digits = false;
+    while (cursor < objectHeader.size() && objectHeader[cursor] >= '0' && objectHeader[cursor] <= '9') {
+        value = value * 10 + (objectHeader[cursor] - '0');
+        ++cursor;
+        digits = true;
+    }
+    if (!digits)
+        return -1;
+
+    // "12 0 R" — the number names an object that holds the length, it is not the length.
+    int probe = cursor;
+    while (probe < objectHeader.size() && objectHeader[probe] == ' ')
+        ++probe;
+    if (probe >= objectHeader.size() || objectHeader[probe] != '0')
+        return value;
+
+    ++probe;
+    while (probe < objectHeader.size() && objectHeader[probe] == ' ')
+        ++probe;
+    if (probe >= objectHeader.size() || objectHeader[probe] != 'R')
+        return value;
+
+    const QByteArray holder = QByteArray::number(value) + " 0 obj";
+    const int holderAt = pdfBuf.indexOf(holder);
+    if (holderAt < 0)
+        return -1;
+
+    int at = holderAt + static_cast<int>(holder.size());
+    while (at < pdfBuf.size() && (pdfBuf[at] == '\n' || pdfBuf[at] == '\r' || pdfBuf[at] == ' '))
+        ++at;
+
+    int resolved = 0;
+    digits = false;
+    while (at < pdfBuf.size() && pdfBuf[at] >= '0' && pdfBuf[at] <= '9') {
+        resolved = resolved * 10 + (pdfBuf[at] - '0');
+        ++at;
+        digits = true;
+    }
+
+    return digits ? resolved : -1;
+}
+}  // namespace
+
 QByteArray SvgToOcgPdf::extractContentStream(const QByteArray &pdfBuf)
 {
-    // Find the content stream object: search for "/Contents N 0 R"
-    // Then find "N 0 obj" and extract the stream data
-
-    // Step 1: find the content object number from the page object
-    const QByteArray marker = "/Contents ";
-    int idx = pdfBuf.indexOf(marker);
-    if (idx < 0) return {};
-
-    idx += marker.size();
-    // Read the object number
-    int contentObjNum = 0;
-    while (idx < pdfBuf.size() && pdfBuf[idx] >= '0' && pdfBuf[idx] <= '9') {
-        contentObjNum = contentObjNum * 10 + (pdfBuf[idx] - '0');
-        idx++;
+    // The page names its content either by one reference — /Contents 5 0 R — or by an array
+    // of them, 5 0 R 6 0 R, when the drawing was written in several parts. Both have to be
+    // read: taking only the first number drops the rest of the drawing on the floor.
+    //
+    // Each part is then located by searching for its header from the part before it, never
+    // from the start of the file. "6 0 obj" occurs inside compressed data often enough, and
+    // a header found there starts the slice in the middle of a stream: inflate then gives
+    // up partway with Z_BUF_ERROR and the layer comes out empty. That is what happened to
+    // the decor layer, whose buffer is the largest and so the likeliest to contain one.
+    const QByteArray marker = "/Contents";
+    const int at = pdfBuf.indexOf(marker);
+    if (at < 0) {
+        return {};
     }
-    if (contentObjNum <= 0) return {};
 
-    // Step 2: find "N 0 obj" for the content object
-    const QByteArray objMarker = QByteArray::number(contentObjNum) + " 0 obj";
-    idx = pdfBuf.indexOf(objMarker);
-    if (idx < 0) return {};
+    int cursor = at + static_cast<int>(marker.size());
+    QVector<int> parts;
+    while (true) {
+        while (cursor < pdfBuf.size()
+               && (pdfBuf[cursor] == ' ' || pdfBuf[cursor] == '\n' || pdfBuf[cursor] == '\r'
+                   || pdfBuf[cursor] == '\t' || pdfBuf[cursor] == '[')) {
+            ++cursor;
+        }
+        if (cursor >= pdfBuf.size() || pdfBuf[cursor] < '0' || pdfBuf[cursor] > '9') {
+            break;
+        }
 
-    // Step 3: find "stream" keyword after the object header
-    idx = pdfBuf.indexOf("stream", idx);
-    if (idx < 0) return {};
+        int number = 0;
+        while (cursor < pdfBuf.size() && pdfBuf[cursor] >= '0' && pdfBuf[cursor] <= '9') {
+            number = number * 10 + (pdfBuf[cursor] - '0');
+            ++cursor;
+        }
 
-    // Skip "stream" and the following newline(s)
-    idx += 6;
-    if (idx < pdfBuf.size() && pdfBuf[idx] == '\r') idx++;
-    if (idx < pdfBuf.size() && pdfBuf[idx] == '\n') idx++;
+        // What must follow is " 0 R" — anything else and this was not a reference.
+        int probe = cursor;
+        while (probe < pdfBuf.size() && pdfBuf[probe] == ' ') ++probe;
+        if (probe >= pdfBuf.size() || pdfBuf[probe] != '0') break;
+        ++probe;
+        while (probe < pdfBuf.size() && pdfBuf[probe] == ' ') ++probe;
+        if (probe >= pdfBuf.size() || pdfBuf[probe] != 'R') break;
 
-    const int streamStart = idx;
+        if (number > 0) {
+            parts.append(number);
+        }
+        cursor = probe + 1;
+    }
 
-    // Step 4: find "endstream"
-    // Search backwards from end to find the matching endstream
-    int endIdx = pdfBuf.indexOf("endstream", streamStart);
-    if (endIdx < 0) return {};
+    if (parts.isEmpty()) {
+        return {};
+    }
 
-    // Trim trailing whitespace before endstream
-    int streamEnd = endIdx;
-    while (streamEnd > streamStart && (pdfBuf[streamEnd - 1] == '\n'
-           || pdfBuf[streamEnd - 1] == '\r' || pdfBuf[streamEnd - 1] == ' '))
-        streamEnd--;
+    QByteArray content;
+    int from = 0;
+    for (int number : parts) {
+        const QByteArray header = QByteArray::number(number) + " 0 obj";
+        const int headerAt = pdfBuf.indexOf(header, from);
+        if (headerAt < 0) continue;
 
-    return pdfBuf.mid(streamStart, streamEnd - streamStart);
+        int start = pdfBuf.indexOf("stream", headerAt + static_cast<int>(header.size()));
+        if (start < 0) continue;
+        start += 6;  // past "stream"
+        if (start < pdfBuf.size() && pdfBuf[start] == '\r') ++start;
+        if (start < pdfBuf.size() && pdfBuf[start] == '\n') ++start;
+
+        const int endAt = pdfBuf.indexOf("endstream", start);
+        if (endAt < 0) continue;
+
+        // The object says how long its stream is; take it at its word. Working back from
+        // "endstream" instead — which is what this did — removes a real byte whenever the
+        // last one of the compressed data happens to be a space, a newline or a carriage
+        // return. inflate then consumes everything, asks for one more, and gives up with
+        // Z_BUF_ERROR. Eight layers got away with it; the decor layer did not.
+        int length = DeclaredStreamLength(pdfBuf, pdfBuf.mid(headerAt, start - headerAt));
+        if (length <= 0 || start + length > endAt) {
+            // Nothing usable declared: fall back to a single line break before "endstream".
+            length = endAt - start;
+            if (length > 0 && pdfBuf[start + length - 1] == '\n') --length;
+            if (length > 0 && pdfBuf[start + length - 1] == '\r') --length;
+        }
+
+        content += decompressFlate(pdfBuf.mid(start, length));
+        from = endAt;
+    }
+
+    if (parts.size() > 1) {
+        qDebug() << "  Content written in" << parts.size() << "parts";
+    }
+
+    return content;
 }
 
 QByteArray SvgToOcgPdf::decompressFlate(const QByteArray &compressed)
@@ -484,13 +665,36 @@ QByteArray SvgToOcgPdf::decompressFlate(const QByteArray &compressed)
     do {
         strm.next_out = reinterpret_cast<Bytef *>(chunk.data());
         strm.avail_out = kChunkSize;
+        const uInt inBefore = strm.avail_in;
         ret = inflate(&strm, Z_NO_FLUSH);
+
         if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
             qWarning() << "decompressFlate: inflate failed with" << ret;
             inflateEnd(&strm);
             return {};
         }
+
         result.append(chunk.data(), kChunkSize - strm.avail_out);
+
+        // Z_BUF_ERROR: inflate could neither consume nor produce — the input ran out before
+        // the end of the stream. It is not a hard error, so the guard above let it through,
+        // and the loop only ever left on Z_STREAM_END. A truncated stream therefore span-
+        // ned for ever, appending nothing, and the caller — the UI thread — froze with it.
+        // A malformed stream has to fail here, not hang: whoever hands us one can be told,
+        // a frozen application can only be force-quit.
+        //
+        // Z_STREAM_END is excluded from that guard, and it matters: a stream that ends
+        // exactly on a chunk boundary makes one last call that consumes nothing and
+        // produces nothing. That is a complete stream, not a stalled one — guarding on
+        // "no progress" alone threw it away, and a layer whose stream comes back empty is
+        // dropped by the caller. A whole decor layer disappeared from the panel that way.
+        const bool stalled = strm.avail_in == inBefore && strm.avail_out == kChunkSize;
+        if (ret != Z_STREAM_END && (ret == Z_BUF_ERROR || stalled)) {
+            qWarning() << "decompressFlate: truncated stream —" << compressed.size()
+                       << "bytes in," << result.size() << "out, inflate returned" << ret;
+            inflateEnd(&strm);
+            return {};
+        }
     } while (ret != Z_STREAM_END);
 
     inflateEnd(&strm);
@@ -655,9 +859,45 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
     return buf;
 }
 
+namespace
+{
+/// @brief The /Info dictionary: what the document says about itself.
+///
+/// A reader shows these in its information panel, and shows an empty panel when there are
+/// none — which is what the hand-built envelope did before this. Qt's own writer fills them
+/// in for free; ours has to be told.
+auto BuildInfoObject(const SvgToOcgPdf::DocumentInfo &info) -> QByteArray
+{
+    const QString producer = info.producer.isEmpty()
+                                 ? QStringLiteral("Trame %1").arg(QString::fromLatin1(TRAME_VERSION))
+                                 : info.producer;
+
+    // The form the PDF spec asks for: D:YYYYMMDDHHmmSSOHH'mm'. Local time, offset included,
+    // so a reader can show it as the clock read when the file was written.
+    const QDateTime now = QDateTime::currentDateTime();
+    const int offsetSeconds = now.offsetFromUtc();
+    const int absOffset = qAbs(offsetSeconds);
+    const QString stamp = QStringLiteral("D:%1%2%3'%4'")
+                              .arg(now.toString(QStringLiteral("yyyyMMddHHmmss")))
+                              .arg(offsetSeconds < 0 ? u'-' : u'+')
+                              .arg(absOffset / 3600, 2, 10, QLatin1Char('0'))
+                              .arg((absOffset % 3600) / 60, 2, 10, QLatin1Char('0'));
+
+    QByteArray body = "<<";
+    if (!info.title.isEmpty())   body += " /Title "   + pdfTextString(info.title);
+    if (!info.author.isEmpty())  body += " /Author "  + pdfTextString(info.author);
+    if (!info.creator.isEmpty()) body += " /Creator " + pdfTextString(info.creator);
+    body += " /Producer " + pdfTextString(producer);
+    body += " /CreationDate " + pdfTextString(stamp);
+    body += " >>\n";
+    return body;
+}
+}  // namespace
+
 bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
                                const PageInfo               &page,
-                               const QVector<LayerContent>  &layers)
+                               const QVector<LayerContent>  &layers,
+                               const DocumentInfo           &info)
 {
     PdfBuilder pdf;
     pdf.header = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
@@ -665,37 +905,46 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     const int catalogObj = pdf.alloc();
     const int pagesObj   = pdf.alloc();
 
-    // Separate size layers from MEP
+    // The information dictionary, which the trailer points at. Without it a reader has
+    // nothing to show — no title, no author, no producer.
+    const int infoObj = pdf.alloc();
+    pdf.infoObj = infoObj;
+    pdf.add(infoObj, BuildInfoObject(info));
+
+    // Separate the size layers from the decor, and tell a layered document from a plain
+    // one: optional content only means something when there is something to switch.
     QVector<const LayerContent *> sizeLayers;
     const LayerContent *mepLayer = nullptr;
+    bool plain = false;
     for (const auto &lc : layers) {
-        if (lc.isMep)
+        if (lc.plain)
+            plain = true;
+        else if (lc.isMep)
             mepLayer = &lc;
         else
             sizeLayers.append(&lc);
     }
+    const bool withOcg = !plain;
 
-    // OCG objects — one per size
+    // OCG objects — one per size. The name is the one the user typed; the id is what
+    // the PDF addresses the layer by, and it is the id that goes in /Properties.
     QVector<int> ocgObjs;
-    ocgObjs.reserve(sizeLayers.size());
-    for (const auto *sz : sizeLayers) {
-        QByteArray body;
-        QTextStream ts(&body);
-        QString displayName = sz->name;
-        displayName.replace(QLatin1Char('_'), QLatin1Char(' '));
-        ts << "<< /Type /OCG /Name (" << displayName << ") >>\n";
-        ts.flush();
-        const int objNum = pdf.alloc();
-        ocgObjs.append(objNum);
-        pdf.add(objNum, body);
+    if (withOcg) {
+        ocgObjs.reserve(sizeLayers.size());
+        for (const auto *sz : sizeLayers) {
+            QByteArray body = "<< /Type /OCG /Name " + pdfTextString(sz->displayName) + " >>\n";
+            const int objNum = pdf.alloc();
+            ocgObjs.append(objNum);
+            pdf.add(objNum, body);
+        }
     }
 
-    // MEP OCG (always ON)
+    // Decor OCG (always ON)
     int mepOcgObj = 0;
-    if (mepLayer) {
+    if (withOcg && mepLayer != nullptr) {
         mepOcgObj = pdf.alloc();
         pdf.add(mepOcgObj,
-                QStringLiteral("<< /Type /OCG /Name (Mise en page) >>\n").toUtf8());
+                "<< /Type /OCG /Name " + pdfTextString(mepLayer->displayName) + " >>\n");
     }
 
     // ExtGState object referenced by QPdfWriter content streams as /GSa gs
@@ -713,14 +962,17 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
 
     QByteArray streamData;
 
+    if (plain) {
+        // Nothing to mark: the whole document is the page.
+        streamData.append(layers.first().stream);
+    }
+
     // Size layers first (bottom)
     // Each layer is wrapped in q...Q to isolate its graphics state (CTM, colors, etc.)
     // since QPdfWriter's per-layer streams start with a cm that concatenates.
     for (int i = 0; i < sizeLayers.size(); ++i) {
-        const QString name = sizeLayers[i]->name;
-
         streamData.append(
-            QStringLiteral("/OC /%1 BDC\nq\n").arg(name).toUtf8());
+            QStringLiteral("/OC /%1 BDC\nq\n").arg(sizeLayers[i]->name).toUtf8());
 
         streamData.append(sizeLayers[i]->stream);
         streamData.append("\nQ\n");
@@ -728,12 +980,12 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
         streamData.append("EMC\n");
     }
 
-    // Mise-en-page layer on top
+    // Decor layer on top
     // QSvgRenderer content and text are in separate q/Q scopes so that
     // the QSvgRenderer CTM (0.75 0 0 -0.75 0 pageH cm) does not affect
     // the text operators, which have their own SVG→PDF conversion.
-    if (mepLayer) {
-        streamData.append("/OC /Mise_en_page BDC\n");
+    if (withOcg && mepLayer != nullptr) {
+        streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mepLayer->name).toUtf8());
         // QSvgRenderer content (paths, logos, grainlines)
         streamData.append("q\n");
         streamData.append(mepLayer->stream);
@@ -754,14 +1006,17 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
 
     // Build Properties dict for OCG
     QByteArray propsDict;
-    if (mepLayer) {
-        propsDict.append(QStringLiteral("      /Mise_en_page %1 0 R\n")
+    if (withOcg && mepLayer != nullptr) {
+        propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
+                             .arg(mepLayer->name)
                              .arg(mepOcgObj).toUtf8());
     }
-    for (int i = 0; i < sizeLayers.size(); ++i) {
-        propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
-                             .arg(sizeLayers[i]->name)
-                             .arg(ocgObjs[i]).toUtf8());
+    if (withOcg) {
+        for (int i = 0; i < sizeLayers.size(); ++i) {
+            propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
+                                 .arg(sizeLayers[i]->name)
+                                 .arg(ocgObjs[i]).toUtf8());
+        }
     }
 
     // Page
@@ -800,7 +1055,11 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
         ocgRefs.append(ref);
         orderRefs.append(ref);
     }
-    for (int i = 0; i < ocgObjs.size(); ++i) {
+    // A reader lists the layers topmost first, and /Order is that list — so it runs
+    // opposite to the painting order, in which the smallest size is drawn last and
+    // therefore sits on top. Walked backwards here so the panel reads small to large,
+    // right under the decor, which is painted last of all and so comes first.
+    for (int i = ocgObjs.size() - 1; i >= 0; --i) {
         const QByteArray ref = QByteArray::number(ocgObjs[i]) + " 0 R ";
         ocgRefs.append(ref);
         orderRefs.append(ref);
@@ -808,24 +1067,31 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     // All layers visible by default
     const QByteArray offRefs("[]");
 
-    pdf.add(catalogObj,
-            QStringLiteral(
-                "<< /Type /Catalog /Pages %1 0 R\n"
-                "   /OCProperties <<\n"
-                "     /OCGs [%2]\n"
-                "     /D <<\n"
-                "       /Order [%3]\n"
-                "       /OFF [%4]\n"
-                "       /AS [<< /Event /View /Category /Print /OCGs [%5] >>]\n"
-                "     >>\n"
-                "   >>\n"
-                ">>\n"
-            ).arg(pagesObj)
-             .arg(QString::fromUtf8(ocgRefs).trimmed())
-             .arg(QString::fromUtf8(orderRefs).trimmed())
-             .arg(QString::fromUtf8(offRefs).trimmed())
-             .arg(QString::fromUtf8(ocgRefs).trimmed())
-             .toUtf8());
+    if (withOcg) {
+        pdf.add(catalogObj,
+                QStringLiteral(
+                    "<< /Type /Catalog /Pages %1 0 R\n"
+                    "   /OCProperties <<\n"
+                    "     /OCGs [%2]\n"
+                    "     /D <<\n"
+                    "       /Order [%3]\n"
+                    "       /OFF [%4]\n"
+                    "       /AS [<< /Event /View /Category /Print /OCGs [%5] >>]\n"
+                    "     >>\n"
+                    "   >>\n"
+                    ">>\n"
+                ).arg(pagesObj)
+                 .arg(QString::fromUtf8(ocgRefs).trimmed())
+                 .arg(QString::fromUtf8(orderRefs).trimmed())
+                 .arg(QString::fromUtf8(offRefs).trimmed())
+                 .arg(QString::fromUtf8(ocgRefs).trimmed())
+                 .toUtf8());
+    } else {
+        // A flat PDF says nothing about optional content, because it has none.
+        pdf.add(catalogObj,
+                QStringLiteral("<< /Type /Catalog /Pages %1 0 R >>\n")
+                    .arg(pagesObj).toUtf8());
+    }
 
     // Write file
     int xrefOffset = 0;
@@ -839,11 +1105,15 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     file.write(fileContent);
     file.close();
 
-    qWarning() << "OCG PDF exported:" << pdfPath;
-    qWarning() << "  Page size:" << pageWidthPt << "×" << pageHeightPt << "pt"
+    qDebug() << "PDF exported:" << pdfPath;
+    qDebug() << "  Page size:" << pageWidthPt << "×" << pageHeightPt << "pt"
                << "(" << page.sizeMm.width() << "×" << page.sizeMm.height() << "mm)";
-    qWarning() << "  OCG layers:" << sizeLayers.size()
-               << "+ MEP:" << (mepLayer ? 1 : 0);
+    if (withOcg) {
+        qDebug() << "  OCG layers:" << sizeLayers.size()
+                   << "+ decor:" << (mepLayer != nullptr ? 1 : 0);
+    } else {
+        qDebug() << "  Flat document: no optional content";
+    }
 
     return true;
 }

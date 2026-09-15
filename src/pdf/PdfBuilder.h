@@ -35,6 +35,10 @@ public:
 
     int nextNum = 1;
 
+    /// The /Info object, when the caller wrote one. Zero leaves the trailer as it was —
+    /// a PDF without an information dictionary is legal, it simply has nothing to say.
+    int infoObj = 0;
+
     int alloc() { return nextNum++; }
 
     void add(int num, const QByteArray &body)
@@ -73,8 +77,12 @@ public:
 
         const int catalogNum = objects.first().num;
         out.append("trailer\n");
-        out.append(QStringLiteral("<< /Size %1 /Root %2 0 R >>\n")
-                   .arg(objects.size() + 1).arg(catalogNum).toUtf8());
+        QByteArray trailer = QStringLiteral("<< /Size %1 /Root %2 0 R")
+                                 .arg(objects.size() + 1).arg(catalogNum).toUtf8();
+        if (infoObj > 0)
+            trailer += QStringLiteral(" /Info %1 0 R").arg(infoObj).toUtf8();
+        trailer += " >>\n";
+        out.append(trailer);
         out.append("startxref\n");
         out.append(QStringLiteral("%1\n").arg(xrefOffset).toUtf8());
         out.append("%%EOF\n");

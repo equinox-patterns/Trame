@@ -1,82 +1,104 @@
 cmake_minimum_required(VERSION 3.15)
-project(Rabnest VERSION 0.2.0 LANGUAGES CXX)
+project(Trame VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_AUTOMOC ON)
 
 # ── Qt 6 ───────────────────────────────────────────────────────────────────
-find_package(Qt6 REQUIRED COMPONENTS Widgets Xml Svg SvgWidgets PrintSupport Concurrent)
+# Le noyau n'a besoin ni de Widgets ni de Concurrent : ils ne servent qu'aux
+# outils (déclarés plus bas) et à l'application consommatrice.
+find_package(Qt6 REQUIRED COMPONENTS Core Xml Svg Gui PrintSupport)
 
 # ── Clipper2 ───────────────────────────────────────────────────────────────
-set(CLIPPER2_UTILS OFF CACHE BOOL "" FORCE)
-set(CLIPPER2_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(CLIPPER2_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/clipper2/CPP EXCLUDE_FROM_ALL)
+# add_library() sur un nom de cible déjà pris est une erreur FATALE, pas un
+# warning : Trame sera le seul endroit qui ajoute Clipper2.
+if(NOT TARGET Clipper2)
+    set(CLIPPER2_UTILS OFF CACHE BOOL "" FORCE)
+    set(CLIPPER2_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(CLIPPER2_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/clipper2/CPP EXCLUDE_FROM_ALL)
+endif()
 
 # ── ZLIB ───────────────────────────────────────────────────────────────────
 find_package(ZLIB REQUIRED)
 
-# ── Rabnest CLI ───────────────────────────────────────────────────────────
-set(RABNEST_SOURCES
-    src/main.cpp
+# ══════════════════════════════════════════════════════════════════════════
+# Trame — socle partagé (bibliothèque statique)
+# ══════════════════════════════════════════════════════════════════════════
+# Le noyau ne contient aucun Q_OBJECT. AUTOMOC coupé : la variable se propage
+# depuis le parent, donc un set(CMAKE_AUTOMOC ON) fait AVANT le
+# add_subdirectory(Trame) côté consommateur contaminerait ce répertoire.
+set(CMAKE_AUTOMOC OFF)
+
+set(TRAME_SOURCES
     src/io/NestedSvgWriter.cpp
     src/io/SvgReader.cpp
     src/nesting/Bin.cpp
     src/nesting/Engine.cpp
     src/nesting/Footprint.cpp
     src/pdf/SvgToOcgPdf.cpp
-    src/ui/NestingDialog.cpp
 )
 
-set(RABNEST_HEADERS
+set(TRAME_HEADERS
     src/model/Piece.h
-    src/model/GradedSize.h
     src/model/Placement.h
+    src/model/GradedSize.h
+    src/io/GradedSvgContract.h
     src/io/NestedSvgWriter.h
     src/io/SvgReader.h
     src/nesting/Bin.h
     src/nesting/Engine.h
     src/nesting/Footprint.h
-    src/pdf/SvgToOcgPdf.h
     src/pdf/PdfBuilder.h
-    src/ui/NestingDialog.h
+    src/pdf/SvgToOcgPdf.h
 )
 
-add_executable(Rabnest ${RABNEST_SOURCES} ${RABNEST_HEADERS})
+add_library(Trame STATIC ${TRAME_SOURCES} ${TRAME_HEADERS})
 
-target_include_directories(Rabnest PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+# PUBLIC : les en-têtes s'incluent par chemin racine ("model/Piece.h",
+# "nesting/Engine.h") — depuis Trame comme depuis ses consommateurs.
+target_include_directories(Trame PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# La version du projet, rendue au code : le renderer PDF l'écrit dans /Producer, et la
+# recopier en dur quelque part mentirait au premier changement de version.
+target_compile_definitions(Trame PUBLIC TRAME_VERSION="${PROJECT_VERSION}")
+
+# PUBLIC — types exposés dans les en-têtes publics :
+#   Qt6::Core -> QString/QVector (Piece.h), QByteArray/QRectF (SvgToOcgPdf.h)
+#   Qt6::Xml  -> QDomElement (SvgToOcgPdf.h)
+#   Clipper2  -> Path64/Paths64 (Piece.h, Engine.h, Footprint.h)
+# PRIVATE — utilisés uniquement dans les .cpp (remontent quand même sur la
+# ligne de link des consommateurs, une statique n'ayant pas de symboles cachés).
+target_link_libraries(Trame
+    PUBLIC
+        Qt6::Core
+        Qt6::Xml
+        Clipper2
+    PRIVATE
+        Qt6::Gui
+        Qt6::Svg
+        Qt6::PrintSupport
+        ZLIB::ZLIB
 )
 
-target_link_libraries(Rabnest PRIVATE
-    Qt6::Widgets
-    Qt6::Xml
-    Qt6::Svg
-    Qt6::PrintSupport
-    Qt6::Concurrent
-    Clipper2
-    ZLIB::ZLIB
-)
+# ══════════════════════════════════════════════════════════════════════════
+# Outils — ne dépendent que du noyau, donc déclarés ici
+# ══════════════════════════════════════════════════════════════════════════
+find_package(Qt6 REQUIRED COMPONENTS Widgets SvgWidgets)
 
-# ── Tools ─────────────────────────────────────────────────────────────────
-
-add_executable(svg2ocgpdf
-    tools/svg2ocgpdf.cpp
-    src/pdf/SvgToOcgPdf.cpp
-)
-target_include_directories(svg2ocgpdf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(svg2ocgpdf PRIVATE
-    Qt6::Widgets
-    Qt6::Svg
-    Qt6::Xml
-    Qt6::PrintSupport
-    ZLIB::ZLIB
-)
-
-# ── Test utilities ─────────────────────────────────────────────────────────
+# svg2ocgpdf ne recompile PLUS src/pdf/SvgToOcgPdf.cpp en dur (849 lignes
+# étaient compilées deux fois) : il prend les objets de libTrame.a.
+add_executable(svg2ocgpdf tools/svg2ocgpdf.cpp)
+target_link_libraries(svg2ocgpdf PRIVATE Trame Qt6::Widgets)
 
 add_executable(svg2pdf tests/svg2pdf.cpp)
-target_link_libraries(svg2pdf PRIVATE Qt6::Widgets Qt6::Svg Qt6::SvgWidgets Qt6::Xml Qt6::PrintSupport)
+target_link_libraries(svg2pdf PRIVATE
+    Qt6::Widgets Qt6::Svg Qt6::SvgWidgets Qt6::Xml Qt6::PrintSupport)
+
+# Harnais headless de non-régression — rejoue le pipeline complet sans UI.
+# C'est le seul moyen de vérifier nesting/ + io/ : l'appli est une GUI sans
+# arguments, et il n'existe aucun test automatisé dans ce dépôt.
+add_executable(nestbench tests/nestbench.cpp)
+target_link_libraries(nestbench PRIVATE Trame)
