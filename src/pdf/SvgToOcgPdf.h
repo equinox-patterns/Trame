@@ -20,6 +20,7 @@
 #include <QRectF>
 #include <QSizeF>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 class SvgToOcgPdf
@@ -49,6 +50,24 @@ public:
 
     bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {});
 
+    /// Convert several SVGs to ONE PDF, one page per SVG, sharing a single set of OCG
+    /// layers.
+    ///
+    /// This is how a tiled plan is delivered: the plan is cut into sheets, and a sheet is
+    /// a page. Each SVG is a sheet — its own width and height give that page's /MediaBox —
+    /// and every sheet is written from the same content, so they all carry the same layer
+    /// ids. The layer set therefore belongs to the DOCUMENT, not to the page: one OCG
+    /// object per layer, referenced by every page that draws it. A reader's panel then
+    /// shows one entry per layer, and switching a size off hides it on every sheet at
+    /// once, which is the only reading of it that makes sense when the sheets are taped
+    /// back together.
+    ///
+    /// @param svgPaths Input SVG files, in page order
+    /// @param pdfPath  Output PDF file
+    /// @return true on success
+    bool convert(const QStringList &svgPaths, const QString &pdfPath,
+                 const DocumentInfo &info = {});
+
 private:
     struct PageInfo
     {
@@ -72,6 +91,18 @@ private:
         QByteArray stream;        // decompressed PDF content from QSvgRenderer
         QByteArray textStream;    // text operators (MEP only), separate CTM scope
         bool       plain = false; // the whole document: no layer, so no optional content
+    };
+
+    /// @brief One SVG, read back: its page, and the rendered content of each of its layers.
+    ///
+    /// Everything the writer needs about one sheet, and nothing else — so the page loop of
+    /// a tiled document has no file left to open and no XML left to parse.
+    struct SvgContent
+    {
+        bool                  ok{false}; ///< false when reading or rendering failed; logged
+        PageInfo              page;
+        QVector<LayerContent> layers;
+        bool                  plain{false}; ///< no layer group at all: a single-size document
     };
 
     QVector<LayerEntry> findLayers(const QDomDocument &doc) const;
@@ -99,10 +130,21 @@ private:
     QByteArray          decompressFlate(const QByteArray &compressed);
     QByteArray          emitMepTextAsPdfOps(const QDomElement &root,
                                               double           pageHeightPt) const;
-    bool                buildOcgPdf(const QString                &pdfPath,
-                                    const PageInfo               &page,
-                                    const QVector<LayerContent>  &layers,
-                                    const DocumentInfo           &info);
+    /// @brief Read one SVG into its page and the rendered content of each of its layers.
+    ///
+    /// The whole of what convert() used to do for a single document, lifted out so that a
+    /// tiled conversion can call it once per sheet. The caller gets a value it can hold;
+    /// nothing here depends on there being exactly one document.
+    SvgContent          readSvg(const QString &svgPath);
+
+    /// @brief Write @p pages as one PDF, one page each, over a single set of OCG layers.
+    ///
+    /// The layer set — and therefore the OCG objects — is decided once, from the first
+    /// page, and shared by every page afterwards. Allocating them per page would put one
+    /// entry per layer PER SHEET in the reader's panel.
+    bool                buildOcgPdf(const QString             &pdfPath,
+                                    const QVector<SvgContent> &pages,
+                                    const DocumentInfo        &info);
 };
 
 #endif // SVGTOOCGPDF_H

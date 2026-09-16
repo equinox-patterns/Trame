@@ -21,6 +21,7 @@
 #include <QFile>
 #include <QFont>
 #include <QFontMetrics>
+#include <QHash>
 #include <QPageSize>
 #include <QPainter>
 #include <QDateTime>
@@ -237,10 +238,43 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info)
 {
+    return convert(QStringList{svgPath}, pdfPath, info);
+}
+
+bool SvgToOcgPdf::convert(const QStringList &svgPaths, const QString &pdfPath,
+                          const DocumentInfo &info)
+{
+    if (svgPaths.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: no input document";
+        return false;
+    }
+
+    QVector<SvgContent> pages;
+    pages.reserve(svgPaths.size());
+
+    for (const QString &svgPath : svgPaths) {
+        SvgContent sheet = readSvg(svgPath);
+        if (!sheet.ok) {
+            // One sheet short and the whole delivery is wrong: every page after it would
+            // be a sheet earlier than it should be, and the reader would tape the plan up
+            // in the wrong order. Handing over nothing beats handing over a plan that
+            // cannot be reassembled.
+            return false;
+        }
+        pages.append(sheet);
+    }
+
+    return buildOcgPdf(pdfPath, pages, info);
+}
+
+SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath)
+{
+    SvgContent result;
+
     QFile svgFile(svgPath);
     if (!svgFile.open(QIODevice::ReadOnly)) {
         qWarning() << "SvgToOcgPdf: cannot open" << svgPath;
-        return false;
+        return result;
     }
     const QByteArray svgData = svgFile.readAll();
     svgFile.close();
@@ -251,28 +285,30 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const 
     if (!doc.setContent(svgData, &errorMsg, &errorLine, &errorCol)) {
         qWarning() << "SvgToOcgPdf: XML parse error at line" << errorLine
                    << ":" << errorMsg;
-        return false;
+        return result;
     }
 
-    const PageInfo page = getPageInfo(doc);
+    result.page = getPageInfo(doc);
     const QVector<LayerEntry> layers = findLayers(doc);
 
     // No layer group at all: a single-size document. It is still owed a PDF — one plain
     // content stream and no optional content, since there is nothing to switch on and
     // off. Refusing it would have left the commonest case with no export at all.
     if (layers.isEmpty()) {
-        qWarning() << "SvgToOcgPdf: no layer group, writing a flat PDF";
+        // A progress line, not a fault — qDebug, never qWarning: a qWarning opens a modal
+        // box in Ostara, and a tiled single-size run would open one PER SHEET.
+        qDebug() << "SvgToOcgPdf: no layer group, writing a flat page";
 
-        const QByteArray pdfBuf = renderToPdfBuffer(svgData, page);
+        const QByteArray pdfBuf = renderToPdfBuffer(svgData, result.page);
         if (pdfBuf.isEmpty()) {
             qWarning() << "SvgToOcgPdf: failed to render the document";
-            return false;
+            return result;
         }
 
         const QByteArray stream = extractContentStream(pdfBuf);
         if (stream.isEmpty()) {
             qWarning() << "SvgToOcgPdf: failed to extract the content stream";
-            return false;
+            return result;
         }
 
         LayerContent whole;
@@ -280,20 +316,22 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const 
         whole.stream = stream;
         whole.plain = true;
 
-        return buildOcgPdf(pdfPath, page, {whole}, info);
+        result.layers.append(whole);
+        result.plain = true;
+        result.ok = true;
+        return result;
     }
 
     qDebug() << "Found" << layers.size() << "layers, page"
-               << page.sizeMm.width() << "x" << page.sizeMm.height() << "mm";
+               << result.page.sizeMm.width() << "x" << result.page.sizeMm.height() << "mm";
 
-    QVector<LayerContent> contents;
-    contents.reserve(layers.size());
+    result.layers.reserve(layers.size());
 
     for (const auto &layer : layers) {
         qDebug() << "  Rendering layer:" << layer.name;
 
-        const QByteArray layerSvg = buildLayerSvg(doc, layer.element, page);
-        const QByteArray pdfBuf = renderToPdfBuffer(layerSvg, page);
+        const QByteArray layerSvg = buildLayerSvg(doc, layer.element, result.page);
+        const QByteArray pdfBuf = renderToPdfBuffer(layerSvg, result.page);
         if (pdfBuf.isEmpty()) {
             qWarning() << "  Failed to render layer:" << layer.name;
             continue;
@@ -309,19 +347,20 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const 
         // For MEP layer, generate text as PDF path operators
         // (kept separate — must not be affected by QSvgRenderer's CTM)
         if (layer.isMep) {
-            const double pageHeightPt = page.sizeMm.height() * kPointsPerMm;
+            const double pageHeightPt = result.page.sizeMm.height() * kPointsPerMm;
             textStream = emitMepTextAsPdfOps(layer.element, pageHeightPt);
         }
 
-        contents.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
+        result.layers.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
     }
 
-    if (contents.isEmpty()) {
+    if (result.layers.isEmpty()) {
         qWarning() << "SvgToOcgPdf: no layer content generated";
-        return false;
+        return result;
     }
 
-    return buildOcgPdf(pdfPath, page, contents, info);
+    result.ok = true;
+    return result;
 }
 
 // ── Private methods ───────────────────────────────────────────────────────
@@ -894,11 +933,15 @@ auto BuildInfoObject(const SvgToOcgPdf::DocumentInfo &info) -> QByteArray
 }
 }  // namespace
 
-bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
-                               const PageInfo               &page,
-                               const QVector<LayerContent>  &layers,
-                               const DocumentInfo           &info)
+bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
+                               const QVector<SvgContent> &pages,
+                               const DocumentInfo        &info)
 {
+    if (pages.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: nothing to write";
+        return false;
+    }
+
     PdfBuilder pdf;
     pdf.header = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
 
@@ -911,20 +954,27 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     pdf.infoObj = infoObj;
     pdf.add(infoObj, BuildInfoObject(info));
 
+    // The layer set belongs to the DOCUMENT, not to the sheet. Every sheet of a tiled plan
+    // is written from one and the same content, so they all carry the same layer ids; one
+    // OCG object per layer, referenced by every page that draws it, is what keeps the
+    // reader's panel to one entry per layer rather than one per layer per sheet. Read off
+    // the first page, which is the one whose content defined them.
+    const SvgContent &first = pages.first();
+    const bool plain = first.plain;
+    const bool withOcg = !plain;
+
     // Separate the size layers from the decor, and tell a layered document from a plain
     // one: optional content only means something when there is something to switch.
     QVector<const LayerContent *> sizeLayers;
     const LayerContent *mepLayer = nullptr;
-    bool plain = false;
-    for (const auto &lc : layers) {
+    for (const auto &lc : first.layers) {
         if (lc.plain)
-            plain = true;
-        else if (lc.isMep)
+            continue;
+        if (lc.isMep)
             mepLayer = &lc;
         else
             sizeLayers.append(&lc);
     }
-    const bool withOcg = !plain;
 
     // OCG objects — one per size. The name is the one the user typed; the id is what
     // the PDF addresses the layer by, and it is the id that goes in /Properties.
@@ -953,58 +1003,9 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
             QStringLiteral("<< /Type /ExtGState /SA true /SM 0.02 /ca 1.0 /CA 1.0"
                            " /AIS false /SMask /None >>\n").toUtf8());
 
-    const int pageObj    = pdf.alloc();
-    const int contentObj = pdf.alloc();
-
-    // Build content stream with BDC/EMC for each layer
-    const double pageHeightPt = page.sizeMm.height() * kPointsPerMm;
-    const double pageWidthPt  = page.sizeMm.width() * kPointsPerMm;
-
-    QByteArray streamData;
-
-    if (plain) {
-        // Nothing to mark: the whole document is the page.
-        streamData.append(layers.first().stream);
-    }
-
-    // Size layers first (bottom)
-    // Each layer is wrapped in q...Q to isolate its graphics state (CTM, colors, etc.)
-    // since QPdfWriter's per-layer streams start with a cm that concatenates.
-    for (int i = 0; i < sizeLayers.size(); ++i) {
-        streamData.append(
-            QStringLiteral("/OC /%1 BDC\nq\n").arg(sizeLayers[i]->name).toUtf8());
-
-        streamData.append(sizeLayers[i]->stream);
-        streamData.append("\nQ\n");
-
-        streamData.append("EMC\n");
-    }
-
-    // Decor layer on top
-    // QSvgRenderer content and text are in separate q/Q scopes so that
-    // the QSvgRenderer CTM (0.75 0 0 -0.75 0 pageH cm) does not affect
-    // the text operators, which have their own SVG→PDF conversion.
-    if (withOcg && mepLayer != nullptr) {
-        streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mepLayer->name).toUtf8());
-        // QSvgRenderer content (paths, logos, grainlines)
-        streamData.append("q\n");
-        streamData.append(mepLayer->stream);
-        streamData.append("\nQ\n");
-        // Text operators (independent CTM scope)
-        if (!mepLayer->textStream.isEmpty()) {
-            streamData.append("q\n");
-            streamData.append(mepLayer->textStream);
-            streamData.append("\nQ\n");
-        }
-        streamData.append("EMC\n");
-    }
-
-    pdf.add(contentObj,
-            QStringLiteral("<< /Length %1 >>\nstream\n").arg(streamData.size()).toUtf8()
-            + streamData
-            + "\nendstream");
-
-    // Build Properties dict for OCG
+    // The Properties dictionary binds each layer NAME — what the content streams address —
+    // to its OCG object. It is the same on every page, because the OCG objects are the
+    // document's; only the streams differ, and the names are what point into them.
     QByteArray propsDict;
     if (withOcg && mepLayer != nullptr) {
         propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
@@ -1019,32 +1020,108 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
         }
     }
 
-    // Page
-    pdf.add(pageObj,
-            QStringLiteral(
-                "<< /Type /Page /Parent %1 0 R\n"
-                "   /MediaBox [0 0 %2 %3]\n"
-                "   /Contents %4 0 R\n"
-                "   /Resources <<\n"
-                "      /ExtGState << /GSa %5 0 R >>\n"
-                "      /ColorSpace << /CSp /DeviceRGB >>\n"
-                "      /Properties <<\n"
-                "%6"
-                "      >>\n"
-                "   >>\n"
-                "   /Group << /Type /Group /S /Transparency >> >>\n"
-            ).arg(pagesObj)
-             .arg(pageWidthPt, 0, 'f', 6)
-             .arg(pageHeightPt, 0, 'f', 6)
-             .arg(contentObj)
-             .arg(gsaObj)
-             .arg(QString::fromUtf8(propsDict))
-             .toUtf8());
+    QVector<int> pageObjs;
+    pageObjs.reserve(pages.size());
 
-    // Pages
+    // One page per sheet, in the order the sheets were handed over — the order they are to
+    // be printed and taped back together in.
+    for (const SvgContent &sheet : pages) {
+        const int pageObj    = pdf.alloc();
+        const int contentObj = pdf.alloc();
+
+        const double pageHeightPt = sheet.page.sizeMm.height() * kPointsPerMm;
+        const double pageWidthPt  = sheet.page.sizeMm.width() * kPointsPerMm;
+
+        // This sheet's streams, by layer name. Looking them up rather than indexing by
+        // position keeps a sheet that carried fewer layers from shifting the others'.
+        QHash<QString, const LayerContent *> byName;
+        for (const LayerContent &lc : sheet.layers)
+            byName.insert(lc.name, &lc);
+
+        QByteArray streamData;
+
+        if (plain) {
+            // Nothing to mark: the whole document is the page.
+            if (!sheet.layers.isEmpty())
+                streamData.append(sheet.layers.first().stream);
+        }
+
+        // Size layers first (bottom)
+        // Each layer is wrapped in q...Q to isolate its graphics state (CTM, colors, etc.)
+        // since QPdfWriter's per-layer streams start with a cm that concatenates.
+        for (const auto *sz : sizeLayers) {
+            const auto it = byName.constFind(sz->name);
+            if (it == byName.constEnd())
+                continue;
+
+            streamData.append(QStringLiteral("/OC /%1 BDC\nq\n").arg(sz->name).toUtf8());
+            streamData.append(it.value()->stream);
+            streamData.append("\nQ\n");
+            streamData.append("EMC\n");
+        }
+
+        // Decor layer on top
+        // QSvgRenderer content and text are in separate q/Q scopes so that
+        // the QSvgRenderer CTM (0.75 0 0 -0.75 0 pageH cm) does not affect
+        // the text operators, which have their own SVG→PDF conversion.
+        if (withOcg && mepLayer != nullptr) {
+            const auto it = byName.constFind(mepLayer->name);
+            if (it != byName.constEnd()) {
+                const LayerContent *mep = it.value();
+                streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mep->name).toUtf8());
+                // QSvgRenderer content (paths, logos, grainlines)
+                streamData.append("q\n");
+                streamData.append(mep->stream);
+                streamData.append("\nQ\n");
+                // Text operators (independent CTM scope)
+                if (!mep->textStream.isEmpty()) {
+                    streamData.append("q\n");
+                    streamData.append(mep->textStream);
+                    streamData.append("\nQ\n");
+                }
+                streamData.append("EMC\n");
+            }
+        }
+
+        pdf.add(contentObj,
+                QStringLiteral("<< /Length %1 >>\nstream\n").arg(streamData.size()).toUtf8()
+                + streamData
+                + "\nendstream");
+
+        // Page
+        pdf.add(pageObj,
+                QStringLiteral(
+                    "<< /Type /Page /Parent %1 0 R\n"
+                    "   /MediaBox [0 0 %2 %3]\n"
+                    "   /Contents %4 0 R\n"
+                    "   /Resources <<\n"
+                    "      /ExtGState << /GSa %5 0 R >>\n"
+                    "      /ColorSpace << /CSp /DeviceRGB >>\n"
+                    "      /Properties <<\n"
+                    "%6"
+                    "      >>\n"
+                    "   >>\n"
+                    "   /Group << /Type /Group /S /Transparency >> >>\n"
+                ).arg(pagesObj)
+                 .arg(pageWidthPt, 0, 'f', 6)
+                 .arg(pageHeightPt, 0, 'f', 6)
+                 .arg(contentObj)
+                 .arg(gsaObj)
+                 .arg(QString::fromUtf8(propsDict))
+                 .toUtf8());
+
+        pageObjs.append(pageObj);
+    }
+
+    // Pages — every sheet, and as many of them as there are.
+    QByteArray kids;
+    for (const int obj : pageObjs)
+        kids.append(QByteArray::number(obj) + " 0 R ");
+
     pdf.add(pagesObj,
-            QStringLiteral("<< /Type /Pages /Kids [%1 0 R] /Count 1 >>\n")
-                .arg(pageObj).toUtf8());
+            QStringLiteral("<< /Type /Pages /Kids [%1] /Count %2 >>\n")
+                .arg(QString::fromUtf8(kids).trimmed())
+                .arg(pageObjs.size()).toUtf8());
 
     // Catalog with OCG
     QByteArray ocgRefs;
@@ -1106,8 +1183,11 @@ bool SvgToOcgPdf::buildOcgPdf(const QString                &pdfPath,
     file.close();
 
     qDebug() << "PDF exported:" << pdfPath;
-    qDebug() << "  Page size:" << pageWidthPt << "×" << pageHeightPt << "pt"
-               << "(" << page.sizeMm.width() << "×" << page.sizeMm.height() << "mm)";
+    qDebug() << "  Pages:" << pageObjs.size();
+    for (const SvgContent &sheet : pages) {
+        qDebug() << "    " << sheet.page.sizeMm.width() << "×" << sheet.page.sizeMm.height()
+                   << "mm";
+    }
     if (withOcg) {
         qDebug() << "  OCG layers:" << sizeLayers.size()
                    << "+ decor:" << (mepLayer != nullptr ? 1 : 0);
