@@ -32,6 +32,7 @@
 
 #include <zlib.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 
@@ -238,33 +239,46 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info)
 {
-    return convert(QStringList{svgPath}, pdfPath, info);
+    // One page, and the document is that page: the rectangle covers everything the SVG
+    // draws. This is what the svg2ocgpdf tool asks for, and it is the shape a single-size
+    // run takes — a document with nothing to cut up is a document with one sheet.
+    const SvgContent doc = readSvg(svgPath);
+    if (!doc.ok)
+        return false;
+
+    const QRectF whole(0.0, 0.0, doc.page.sizeMm.width() * kPixelsPerMm,
+                       doc.page.sizeMm.height() * kPixelsPerMm);
+
+    return buildOcgPdf(pdfPath, doc, QVector<QRectF>{whole}, info);
 }
 
-bool SvgToOcgPdf::convert(const QStringList &svgPaths, const QString &pdfPath,
-                          const DocumentInfo &info)
+bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
+                          const QString &pdfPath, const DocumentInfo &info)
 {
-    if (svgPaths.isEmpty()) {
-        qWarning() << "SvgToOcgPdf: no input document";
+    if (pages.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: no page to write";
         return false;
     }
 
-    QVector<SvgContent> pages;
-    pages.reserve(svgPaths.size());
-
-    for (const QString &svgPath : svgPaths) {
-        SvgContent sheet = readSvg(svgPath);
-        if (!sheet.ok) {
-            // One sheet short and the whole delivery is wrong: every page after it would
-            // be a sheet earlier than it should be, and the reader would tape the plan up
-            // in the wrong order. Handing over nothing beats handing over a plan that
-            // cannot be reassembled.
+    for (const QRectF &page : pages) {
+        // PDF 32000-1 §14.11.2 asks a /MediaBox to measure at least 3 by 3 units, and a
+        // page with no surface is not a page whatever the spec says. Refusing beats
+        // emitting a sheet nobody can print.
+        if (page.width() <= 0.0 || page.height() <= 0.0) {
+            qWarning() << "SvgToOcgPdf: a page rectangle has no surface" << page;
             return false;
         }
-        pages.append(sheet);
     }
 
-    return buildOcgPdf(pdfPath, pages, info);
+    const SvgContent doc = readSvg(svgPath);
+    if (!doc.ok) {
+        // An unreadable document is not a plan with one sheet missing: it is every sheet
+        // wrong, because they all draw the same thing. Handing over nothing beats handing
+        // over a plan that cannot be reassembled.
+        return false;
+    }
+
+    return buildOcgPdf(pdfPath, doc, pages, info);
 }
 
 SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath)
@@ -931,11 +945,90 @@ auto BuildInfoObject(const SvgToOcgPdf::DocumentInfo &info) -> QByteArray
     body += " >>\n";
     return body;
 }
+
+/// @brief The six numbers of the cm QPdfWriter puts at the head of every stream it renders.
+///
+/// Each stream opens with `/GSa gs /CSp cs /CSp CS` and then `0.75 0 0 -0.75 0 <h> cm`,
+/// which carries the three facts that place a page over the plan: the pixel-to-point
+/// scale, the Y flip, and the height the flip turns about. All three are READ off the
+/// stream rather than assumed, for two reasons, and both of them are about an answer that
+/// would look right and be wrong:
+///
+///  - the flip constant is Qt's page height in points, ROUNDED TO A WHOLE POINT. It is not
+///    recoverable by arithmetic from anything the caller knows — only from the stream.
+///  - the scale is 72/resolution only while Qt reports no /UserUnit. QPdfEngine starts
+///    dividing by userUnit as soon as the PDF version reaches 1.6 AND a page's long side
+///    passes 14400 pt (5080 mm), which an A0 frame five rows deep already does. This module
+///    asks for PdfVersion_1_4, so that branch is dormant today — but a hard-coded 0.75
+///    would place a silently SHRUNKEN plan the day somebody raises the version to match the
+///    %PDF-1.7 this file already declares.
+///
+/// Reading the cm costs a scan of the first few tokens and is right in both worlds.
+struct Placement
+{
+    double a{kPixelToPt};   ///< x scale, pixels → points
+    double b{0.0};
+    double c{0.0};
+    double d{-kPixelToPt};  ///< y scale: negative, which is the flip
+    double e{0.0};
+    double f{0.0};          ///< the height the flip turns about, in points
+};
+
+/// @brief Read the first cm of @p stream into @p out. False when there is none to read.
+auto ReadPlacement(const QByteArray &stream, Placement &out) -> bool
+{
+    QVector<double> numbers;
+    int             i = 0;
+    const int       n = stream.size();
+
+    while (i < n) {
+        const char ch = stream.at(i);
+        if (ch == '%') {  // a comment runs to the end of its line
+            while (i < n && stream.at(i) != '\n')
+                ++i;
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            ++i;
+            continue;
+        }
+
+        const int start = i;
+        while (i < n && !std::isspace(static_cast<unsigned char>(stream.at(i))))
+            ++i;
+
+        const QByteArray token = stream.mid(start, i - start);
+
+        bool         isNumber = false;
+        const double value    = token.toDouble(&isNumber);
+        if (isNumber) {
+            numbers.append(value);
+            continue;
+        }
+
+        if (token == "cm" && numbers.size() >= 6) {
+            const int at = numbers.size() - 6;
+            out.a        = numbers.at(at);
+            out.b        = numbers.at(at + 1);
+            out.c        = numbers.at(at + 2);
+            out.d        = numbers.at(at + 3);
+            out.e        = numbers.at(at + 4);
+            out.f        = numbers.at(at + 5);
+            return true;
+        }
+
+        // Any other operator ends the run: the operands of a cm are adjacent to it.
+        numbers.clear();
+    }
+
+    return false;
+}
 }  // namespace
 
-bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
-                               const QVector<SvgContent> &pages,
-                               const DocumentInfo        &info)
+bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
+                               const SvgContent      &doc,
+                               const QVector<QRectF> &pages,
+                               const DocumentInfo    &info)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: nothing to write";
@@ -945,6 +1038,19 @@ bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
     PdfBuilder pdf;
     pdf.header = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
 
+    // Allocate and add in one step, always. The xref is written positionally, one entry
+    // per object, so a number that is allocated and never added — or added twice — shifts
+    // every offset after it and produces a file that opens to garbage. There is nothing in
+    // PdfBuilder that would say so.
+    const auto addObject = [&pdf](const QByteArray &body) {
+        const int num = pdf.alloc();
+        pdf.add(num, body);
+        return num;
+    };
+
+    // Both of these are added at the end, once every object they point at exists. What
+    // matters is that they are ALLOCATED first: PdfBuilder takes the trailer's /Root to be
+    // the lowest-numbered object in the file, and the catalog has to be it.
     const int catalogObj = pdf.alloc();
     const int pagesObj   = pdf.alloc();
 
@@ -954,26 +1060,36 @@ bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
     pdf.infoObj = infoObj;
     pdf.add(infoObj, BuildInfoObject(info));
 
-    // The layer set belongs to the DOCUMENT, not to the sheet. Every sheet of a tiled plan
-    // is written from one and the same content, so they all carry the same layer ids; one
-    // OCG object per layer, referenced by every page that draws it, is what keeps the
-    // reader's panel to one entry per layer rather than one per layer per sheet. Read off
-    // the first page, which is the one whose content defined them.
-    const SvgContent &first = pages.first();
-    const bool plain = first.plain;
+    // The layer set belongs to the DOCUMENT, and there is now only one document: every
+    // page draws the same layers and differs only in which part of the plan it shows. One
+    // OCG object per layer, referenced by every page, keeps the reader's panel to one
+    // entry per layer rather than one per layer per sheet.
+    const bool plain = doc.plain;
     const bool withOcg = !plain;
 
     // Separate the size layers from the decor, and tell a layered document from a plain
     // one: optional content only means something when there is something to switch.
     QVector<const LayerContent *> sizeLayers;
     const LayerContent *mepLayer = nullptr;
-    for (const auto &lc : first.layers) {
+    for (const auto &lc : doc.layers) {
         if (lc.plain)
             continue;
         if (lc.isMep)
             mepLayer = &lc;
         else
             sizeLayers.append(&lc);
+    }
+
+    // Painting order, bottom first — the sizes, then the decor over them. It is the order
+    // the forms are written in, and the order every page invokes them in.
+    QVector<const LayerContent *> drawing;
+    if (plain) {
+        if (!doc.layers.isEmpty())
+            drawing.append(&doc.layers.first());
+    } else {
+        drawing = sizeLayers;
+        if (mepLayer != nullptr)
+            drawing.append(mepLayer);
     }
 
     // OCG objects — one per size. The name is the one the user typed; the id is what
@@ -1020,95 +1136,190 @@ bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
         }
     }
 
+    // The plan: all the pages together. Derived from the rectangles rather than handed
+    // over beside them, because a third figure to keep in agreement with the other two is
+    // a third figure that can disagree. It serves one thing only — sizing the /BBox — and
+    // takes no part in the page arithmetic.
+    QRectF plan;
+    for (const QRectF &page : pages)
+        plan = plan.united(page);
+
+    // Where Qt placed the drawing inside a rendered stream, read off the streams instead of
+    // assumed. They are all written the same way; a disagreement means an assumption has
+    // moved under us, and the last thing to do is place pages from a value that is only
+    // sometimes right.
+    Placement placement;
+    bool havePlacement = false;
+    for (const LayerContent *layer : drawing) {
+        if (layer->stream.isEmpty())
+            continue;
+        Placement found;
+        if (!ReadPlacement(layer->stream, found)) {
+            qWarning() << "SvgToOcgPdf: no placement cm at the head of a rendered stream";
+            break;
+        }
+        if (!havePlacement) {
+            placement = found;
+            havePlacement = true;
+            continue;
+        }
+        const auto differs = [](double x, double y) { return std::abs(x - y) > 1e-6; };
+        if (differs(found.a, placement.a) || differs(found.d, placement.d)
+            || differs(found.f, placement.f)) {
+            qWarning() << "SvgToOcgPdf: layers disagree on their placement:"
+                       << found.a << found.d << found.f << "against"
+                       << placement.a << placement.d << placement.f;
+        }
+    }
+
+    if (!havePlacement) {
+        // What this module used to hard-code. A sub-point offset is a far better outcome
+        // than a failed export, so the fallback stays — the warning is what keeps it from
+        // being a silent one.
+        qWarning() << "SvgToOcgPdf: no placement to read; falling back to" << kPixelToPt
+                   << "px→pt and a flip about" << kPixelToPt * plan.bottom();
+        placement = Placement{};
+        placement.f = kPixelToPt * plan.bottom();
+    }
+
+    if (placement.b != 0.0 || placement.c != 0.0) {
+        // Nothing Qt has produced has a shear here, and the page arithmetic below does not
+        // carry one. Say so rather than place pages as if it were zero.
+        qWarning() << "SvgToOcgPdf: the placement is sheared (" << placement.b
+                   << placement.c << "); pages are placed as if it were not";
+    }
+
+    if (placement.a * plan.width() <= 0.0 || -placement.d * plan.height() <= 0.0) {
+        qWarning() << "SvgToOcgPdf: the placement gives the plan no surface";
+        return false;
+    }
+
+    // The form's /BBox clips, so it has to hold every page's /MediaBox mapped into form
+    // space — and that is the whole plan. A point of the plan (sx, sy) sits there at
+    // (a·sx + e, d·sy + f), and d is negative: that is the Y flip. A point of bleed each
+    // way, because a clip is the one thing that cannot recover from being a hair short,
+    // and the page's own /MediaBox is what decides what actually shows.
+    constexpr double kBleedPt = 1.0;
+    const QByteArray bbox =
+        QStringLiteral("%1 %2 %3 %4")
+            .arg(placement.a * plan.left() + placement.e - kBleedPt, 0, 'f', 6)
+            .arg(placement.d * plan.bottom() + placement.f - kBleedPt, 0, 'f', 6)
+            .arg(placement.a * plan.right() + placement.e + kBleedPt, 0, 'f', 6)
+            .arg(placement.d * plan.top() + placement.f + kBleedPt, 0, 'f', 6)
+            .toUtf8();
+
+    // One Form XObject per layer, written once and invoked by every page: the plan is in
+    // the file a single time. It is also RENDERED a single time, and that is the other half
+    // of the win — a document read once is M renders, where a page read its own copy was
+    // N×M of them.
+    QVector<int> formObjs;
+    formObjs.reserve(drawing.size());
+
+    for (const LayerContent *layer : drawing) {
+        // The decor arrives as two streams — the shapes QSvgRenderer drew, and the text
+        // this module re-emits as path operators — because they are converted by different
+        // hands and must not share a CTM. One form holds both, each in its own q/Q.
+        QByteArray content;
+        if (layer->isMep) {
+            content.append("q\n");
+            content.append(layer->stream);
+            content.append("\nQ\n");
+            if (!layer->textStream.isEmpty()) {
+                content.append("q\n");
+                content.append(layer->textStream);
+                content.append("\nQ\n");
+            }
+        } else {
+            content.append(layer->stream);
+        }
+
+        formObjs.append(addObject(
+            QStringLiteral(
+                "<< /Type /XObject /Subtype /Form\n"
+                "   /BBox [%1]\n"
+                "   /Resources <<\n"
+                "      /ExtGState << /GSa %2 0 R >>\n"
+                "      /ColorSpace << /CSp /DeviceRGB >>\n"
+                "   >>\n"
+                "   /Length %3 >>\n"
+                "stream\n"
+            ).arg(QString::fromUtf8(bbox)).arg(gsaObj).arg(content.size()).toUtf8()
+            + content
+            + "\nendstream"));
+    }
+
     QVector<int> pageObjs;
     pageObjs.reserve(pages.size());
 
-    // One page per sheet, in the order the sheets were handed over — the order they are to
-    // be printed and taped back together in.
-    for (const SvgContent &sheet : pages) {
-        const int pageObj    = pdf.alloc();
-        const int contentObj = pdf.alloc();
+    // One page per rectangle, in the order they were handed over — the order the sheets are
+    // to be printed and taped back together in.
+    for (const QRectF &page : pages) {
+        const double pageWidthPt  = placement.a * page.width();
+        const double pageHeightPt = -placement.d * page.height();
 
-        const double pageHeightPt = sheet.page.sizeMm.height() * kPointsPerMm;
-        const double pageWidthPt  = sheet.page.sizeMm.width() * kPointsPerMm;
-
-        // This sheet's streams, by layer name. Looking them up rather than indexing by
-        // position keeps a sheet that carried fewer layers from shifting the others'.
-        QHash<QString, const LayerContent *> byName;
-        for (const LayerContent &lc : sheet.layers)
-            byName.insert(lc.name, &lc);
+        // A sheet shows one rectangle of the plan, at the plan's own scale. Undoing the
+        // placement for that rectangle's corner is the whole of what makes it a sheet: the
+        // sheet wants x_page = a·(sx − rx) and y_page = −d·(ry + rh − sy), and the form
+        // draws sx at a·sx + e and sy at d·sy + f.
+        const double dx = -placement.a * page.x() - placement.e;
+        const double dy = -placement.d * (page.y() + page.height()) - placement.f;
 
         QByteArray streamData;
+        streamData.append("q\n");
+        streamData.append(QStringLiteral("1 0 0 1 %1 %2 cm\n")
+                              .arg(dx, 0, 'f', 6)
+                              .arg(dy, 0, 'f', 6)
+                              .toUtf8());
 
-        if (plain) {
-            // Nothing to mark: the whole document is the page.
-            if (!sheet.layers.isEmpty())
-                streamData.append(sheet.layers.first().stream);
-        }
-
-        // Size layers first (bottom)
-        // Each layer is wrapped in q...Q to isolate its graphics state (CTM, colors, etc.)
-        // since QPdfWriter's per-layer streams start with a cm that concatenates.
-        for (const auto *sz : sizeLayers) {
-            const auto it = byName.constFind(sz->name);
-            if (it == byName.constEnd())
-                continue;
-
-            streamData.append(QStringLiteral("/OC /%1 BDC\nq\n").arg(sz->name).toUtf8());
-            streamData.append(it.value()->stream);
-            streamData.append("\nQ\n");
-            streamData.append("EMC\n");
-        }
-
-        // Decor layer on top
-        // QSvgRenderer content and text are in separate q/Q scopes so that
-        // the QSvgRenderer CTM (0.75 0 0 -0.75 0 pageH cm) does not affect
-        // the text operators, which have their own SVG→PDF conversion.
-        if (withOcg && mepLayer != nullptr) {
-            const auto it = byName.constFind(mepLayer->name);
-            if (it != byName.constEnd()) {
-                const LayerContent *mep = it.value();
-                streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mep->name).toUtf8());
-                // QSvgRenderer content (paths, logos, grainlines)
-                streamData.append("q\n");
-                streamData.append(mep->stream);
-                streamData.append("\nQ\n");
-                // Text operators (independent CTM scope)
-                if (!mep->textStream.isEmpty()) {
-                    streamData.append("q\n");
-                    streamData.append(mep->textStream);
-                    streamData.append("\nQ\n");
-                }
+        for (int i = 0; i < drawing.size(); ++i) {
+            const LayerContent *layer = drawing.at(i);
+            // The layer markers stay HERE, in the page's own stream, resolving through the
+            // /Properties of the page — which is where they have always been. Only the
+            // drawing moved into the form, and this is what keeps the layer logic still.
+            if (withOcg)
+                streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(layer->name).toUtf8());
+            streamData.append(QStringLiteral("q\n/Fm%1 Do\nQ\n").arg(i).toUtf8());
+            if (withOcg)
                 streamData.append("EMC\n");
-            }
         }
+        streamData.append("Q\n");
 
-        pdf.add(contentObj,
-                QStringLiteral("<< /Length %1 >>\nstream\n").arg(streamData.size()).toUtf8()
-                + streamData
-                + "\nendstream");
+        const int contentObj = addObject(
+            QStringLiteral("<< /Length %1 >>\nstream\n").arg(streamData.size()).toUtf8()
+            + streamData
+            + "\nendstream");
 
-        // Page
-        pdf.add(pageObj,
-                QStringLiteral(
-                    "<< /Type /Page /Parent %1 0 R\n"
-                    "   /MediaBox [0 0 %2 %3]\n"
-                    "   /Contents %4 0 R\n"
-                    "   /Resources <<\n"
-                    "      /ExtGState << /GSa %5 0 R >>\n"
-                    "      /ColorSpace << /CSp /DeviceRGB >>\n"
-                    "      /Properties <<\n"
-                    "%6"
-                    "      >>\n"
-                    "   >>\n"
-                    "   /Group << /Type /Group /S /Transparency >> >>\n"
-                ).arg(pagesObj)
-                 .arg(pageWidthPt, 0, 'f', 6)
-                 .arg(pageHeightPt, 0, 'f', 6)
-                 .arg(contentObj)
-                 .arg(gsaObj)
-                 .arg(QString::fromUtf8(propsDict))
-                 .toUtf8());
+        QByteArray xobjects;
+        for (int i = 0; i < formObjs.size(); ++i)
+            xobjects.append(QStringLiteral("      /Fm%1 %2 0 R\n")
+                                .arg(i)
+                                .arg(formObjs.at(i))
+                                .toUtf8());
+
+        const int pageObj = addObject(
+            QStringLiteral(
+                "<< /Type /Page /Parent %1 0 R\n"
+                "   /MediaBox [0 0 %2 %3]\n"
+                "   /Contents %4 0 R\n"
+                "   /Resources <<\n"
+                "      /ExtGState << /GSa %5 0 R >>\n"
+                "      /ColorSpace << /CSp /DeviceRGB >>\n"
+                "      /XObject <<\n"
+                "%6"
+                "      >>\n"
+                "      /Properties <<\n"
+                "%7"
+                "      >>\n"
+                "   >>\n"
+                "   /Group << /Type /Group /S /Transparency >> >>\n"
+            ).arg(pagesObj)
+             .arg(pageWidthPt, 0, 'f', 6)
+             .arg(pageHeightPt, 0, 'f', 6)
+             .arg(contentObj)
+             .arg(gsaObj)
+             .arg(QString::fromUtf8(xobjects))
+             .arg(QString::fromUtf8(propsDict))
+             .toUtf8());
 
         pageObjs.append(pageObj);
     }
@@ -1183,11 +1394,11 @@ bool SvgToOcgPdf::buildOcgPdf(const QString             &pdfPath,
     file.close();
 
     qDebug() << "PDF exported:" << pdfPath;
-    qDebug() << "  Pages:" << pageObjs.size();
-    for (const SvgContent &sheet : pages) {
-        qDebug() << "    " << sheet.page.sizeMm.width() << "×" << sheet.page.sizeMm.height()
-                   << "mm";
-    }
+    qDebug() << "  Pages:" << pageObjs.size() << "of"
+             << QStringLiteral("%1 × %2 pt")
+                    .arg(placement.a * pages.first().width(), 0, 'f', 2)
+                    .arg(-placement.d * pages.first().height(), 0, 'f', 2);
+    qDebug() << "  Forms:" << formObjs.size() << "— the plan is written and rendered once";
     if (withOcg) {
         qDebug() << "  OCG layers:" << sizeLayers.size()
                    << "+ decor:" << (mepLayer != nullptr ? 1 : 0);

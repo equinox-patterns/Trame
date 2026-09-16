@@ -20,7 +20,6 @@
 #include <QRectF>
 #include <QSizeF>
 #include <QString>
-#include <QStringList>
 #include <QVector>
 
 class SvgToOcgPdf
@@ -50,22 +49,31 @@ public:
 
     bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {});
 
-    /// Convert several SVGs to ONE PDF, one page per SVG, sharing a single set of OCG
-    /// layers.
+    /// @brief Write @p svgPath as ONE PDF, one page per rectangle in @p pages.
     ///
-    /// This is how a tiled plan is delivered: the plan is cut into sheets, and a sheet is
-    /// a page. Each SVG is a sheet — its own width and height give that page's /MediaBox —
-    /// and every sheet is written from the same content, so they all carry the same layer
-    /// ids. The layer set therefore belongs to the DOCUMENT, not to the page: one OCG
-    /// object per layer, referenced by every page that draws it. A reader's panel then
-    /// shows one entry per layer, and switching a size off hides it on every sheet at
-    /// once, which is the only reading of it that makes sense when the sheets are taped
-    /// back together.
+    /// This is how a tiled plan is delivered, and how a single-size run is delivered too:
+    /// the drawing is written ONCE — one Form XObject per layer — and each page is a
+    /// reference to those objects, offset so that its own rectangle of the plan lands on
+    /// the sheet. The plan is therefore addressed N times rather than copied N times,
+    /// which is what makes a tiled export cost the same whatever its page count, and what
+    /// leaves the page's own content stream free for the decor that belongs to a sheet
+    /// rather than to the plan.
     ///
-    /// @param svgPaths Input SVG files, in page order
+    /// The layer set belongs to the DOCUMENT, since there is only one: one OCG object per
+    /// layer, referenced by every page. A reader's panel shows one entry per layer, and
+    /// switching a size off hides it on every sheet at once — the only reading of it that
+    /// makes sense when the sheets are taped back together.
+    ///
+    /// @param svgPath  Input SVG, spanning the whole plan
+    /// @param pages    The page rectangles, in page order, in the SVG's own user
+    ///                 coordinates — the same frame as its viewBox. They are expected at
+    ///                 96 dpi, which is the resolution the graded writer assumes and the
+    ///                 one kPixelToPt converts from.
     /// @param pdfPath  Output PDF file
     /// @return true on success
-    bool convert(const QStringList &svgPaths, const QString &pdfPath,
+    bool convert(const QString     &svgPath,
+                 const QVector<QRectF> &pages,
+                 const QString     &pdfPath,
                  const DocumentInfo &info = {});
 
 private:
@@ -95,8 +103,10 @@ private:
 
     /// @brief One SVG, read back: its page, and the rendered content of each of its layers.
     ///
-    /// Everything the writer needs about one sheet, and nothing else — so the page loop of
-    /// a tiled document has no file left to open and no XML left to parse.
+    /// Everything the writer needs, and nothing else: once this value exists the document
+    /// has no file left to open and no XML left to parse, and every page is written from
+    /// it. Reading it once is the whole point — it is the step that used to be repeated
+    /// for every sheet.
     struct SvgContent
     {
         bool                  ok{false}; ///< false when reading or rendering failed; logged
@@ -137,14 +147,17 @@ private:
     /// nothing here depends on there being exactly one document.
     SvgContent          readSvg(const QString &svgPath);
 
-    /// @brief Write @p pages as one PDF, one page each, over a single set of OCG layers.
+    /// @brief Write @p doc as one PDF, one page per rectangle, over a single layer set.
     ///
-    /// The layer set — and therefore the OCG objects — is decided once, from the first
-    /// page, and shared by every page afterwards. Allocating them per page would put one
-    /// entry per layer PER SHEET in the reader's panel.
-    bool                buildOcgPdf(const QString             &pdfPath,
-                                    const QVector<SvgContent> &pages,
-                                    const DocumentInfo        &info);
+    /// Every page draws the same layers and differs only in which part of the plan it
+    /// shows, so the layers become Form XObjects written once and invoked N times, and an
+    /// OCG object per layer is allocated once and referenced by every page. Allocating
+    /// either per page would put one entry per layer per sheet in the reader's panel, and
+    /// would put the drawing itself in the file once per sheet.
+    bool                buildOcgPdf(const QString         &pdfPath,
+                                    const SvgContent      &doc,
+                                    const QVector<QRectF> &pages,
+                                    const DocumentInfo    &info);
 };
 
 #endif // SVGTOOCGPDF_H
