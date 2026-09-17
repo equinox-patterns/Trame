@@ -15,13 +15,22 @@
  **          dégagement mesuré double quand le jeu demandé double, le facteur
  **          est confirmé.
  **
- **  Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm> [colonnes hauteur_cadre_mm]
+ **  Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm>
+ **                  [colonnes hauteur_cadre_mm [raffiner [pages_interdites]]]
  **
- **          Sans les deux derniers arguments, l'instrument ne mesure que le jeu.
- **          Avec eux, il construit la grille des cadres — exactement comme
- **          Ostara la construit — et compte les bords d'empreinte trop proches
- **          d'une ligne de coupe. La tolérance est le jeu lui-même : c'est la
- **          décision de Sophie du 15-09-2026.
+ **          Sans les deux premiers arguments optionnels, l'instrument ne mesure
+ **          que le jeu. Avec eux, il construit la grille des cadres — exactement
+ **          comme Ostara la construit — et compte les bords d'empreinte trop
+ **          proches d'une ligne de coupe. La tolérance est le jeu lui-même :
+ **          c'est la décision de Sophie du 15-09-2026.
+ **
+ **          `raffiner` = 0 mesure la grille SANS lancer la passe 2 — c'est le
+ **          « avant » reproductible, et l'inverse de ce que le nom laisse croire.
+ **
+ **          `pages_interdites` = « ligne:colonne,ligne:colonne », 1-based. Chaque
+ **          case nommée devient une zone interdite du Bin : le moteur doit poser
+ **          toutes les pièces ailleurs, ou échouer. C'est le mécanisme des « pages
+ **          interdites » (ExportPDF.md §16), mesuré AVANT qu'Ostara ne s'en serve.
  **
  **  @copyright
  **  Copyright (C) 2026 Sophie Denys <contact@sophiedenys.com>
@@ -32,6 +41,7 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <algorithm>
@@ -46,6 +56,7 @@
 #include "nesting/Bin.h"
 #include "nesting/Engine.h"
 #include "nesting/Footprint.h"
+#include "nesting/TiledEngine.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  La construction du Bin et du Config reproduit celle de nestbench.cpp — le
@@ -279,6 +290,60 @@ double BBoxGap(const BBox &a, const BBox &b)
     return std::hypot(dx, dy);
 }
 
+/// « ligne:colonne,ligne:colonne » — 1-based, comme on lit un plan.
+///
+/// Chaque couple devient UNE cellule de la grille, construite comme Ostara
+/// construit la sienne (OExportArtboards::Compute) : la largeur du bin divisée
+/// par le nombre de colonnes, la hauteur du cadre telle quelle. Une « page
+/// interdite » est une case de la grille, et rien d'autre.
+///
+/// Rend false quand la spécification est illisible : un instrument qui mesure
+/// autre chose que ce qu'on lui a demandé ne mesure rien.
+bool ParseZones(const QString &spec, double binWidthPx, int columns,
+                double frameHeightMm, std::vector<Bin::Zone> &out)
+{
+    out.clear();
+    if (spec.isEmpty())
+    {
+        return true;
+    }
+
+    if (columns < 1 || frameHeightMm <= 0.0)
+    {
+        std::fprintf(stderr,
+                     "Les pages interdites exigent <colonnes> et <hauteur_cadre_mm>.\n");
+        return false;
+    }
+
+    const double cellWpx = binWidthPx / columns;
+    const double cellHpx = frameHeightMm * kMmToPx;
+
+    const QStringList cells = spec.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &cell : cells)
+    {
+        const QStringList rc = cell.split(QLatin1Char(':'), Qt::SkipEmptyParts);
+        if (rc.size() != 2)
+        {
+            std::fprintf(stderr, "Page interdite illisible : « %s » (attendu ligne:colonne).\n",
+                         qPrintable(cell));
+            return false;
+        }
+
+        const int row = rc[0].toInt();
+        const int col = rc[1].toInt();
+        if (row < 1 || col < 1 || col > columns)
+        {
+            std::fprintf(stderr, "Page interdite hors grille : %d:%d (%d colonnes).\n",
+                         row, col, columns);
+            return false;
+        }
+
+        out.push_back({(col - 1) * cellWpx, (row - 1) * cellHpx, cellWpx, cellHpx});
+    }
+
+    return true;
+}
+
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -287,13 +352,19 @@ int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
-    if (argc != 4 && argc != 6 && argc != 7)
+    if (argc != 4 && argc != 6 && argc != 7 && argc != 8 && argc != 9)
     {
         std::fprintf(stderr,
                      "Usage : gapbench <entree.svg> <largeur_bin_mm> <jeu_mm>"
-                     " [colonnes hauteur_cadre_mm [raffiner]]\n"
+                     " [colonnes hauteur_cadre_mm [raffiner [pages_interdites [moteur]]]]\n"
                      "        raffiner = 0 mesure la grille SANS lancer la passe 2 :\n"
-                     "        c'est le « avant » reproductible.\n");
+                     "        c'est le « avant » reproductible.\n"
+                     "        pages_interdites = « ligne:colonne,ligne:colonne » (1-based) :\n"
+                     "        chaque case nommee est une page sur laquelle RIEN ne doit\n"
+                     "        s'imprimer. Le moteur doit la contourner, ou echouer.\n"
+                     "        moteur = bande (defaut, minimise une hauteur) ou tiled\n"
+                     "        (paie en pages : grosses pieces d'abord, puis les petites\n"
+                     "        dans les trous au vrai contour).\n");
         return 2;
     }
 
@@ -303,6 +374,8 @@ int main(int argc, char *argv[])
     const int     columns       = (argc >= 6) ? QString::fromLocal8Bit(argv[4]).toInt() : 0;
     const double  frameHeightMm = (argc >= 6) ? QString::fromLocal8Bit(argv[5]).toDouble() : 0.0;
     const bool    refineWanted  = (argc < 7) || (QString::fromLocal8Bit(argv[6]) != QLatin1String("0"));
+    const QString zoneSpec      = (argc >= 8) ? QString::fromLocal8Bit(argv[7]) : QString();
+    const QString engineSpec    = (argc >= 9) ? QString::fromLocal8Bit(argv[8]) : QString();
 
     if (binWidthMm <= 0.0 || gapMm < 0.0)
     {
@@ -331,17 +404,53 @@ int main(int argc, char *argv[])
     // L'obstacle A4 de nestbench n'est posé QUE sur un run NON tuilé.
     //
     // La règle d'origine — « bin ≤ 841 mm » — décrit le roulé A0, dont c'est la
-    // largeur. Sur un tuilage elle est fausse deux fois : un bin étroit y est
-    // simplement un petit nombre de colonnes, et le mode Export ne pose jamais
-    // d'obstacle (Nesting.md:129 — « Aucun obstacle dans le bin »). Les deux
-    // conséquences sont mesurables : le recuit est perturbé, et la passe 2 refuse
-    // carrément de tourner (EngineRefine.cpp:210).
+    // largeur. Sur un tuilage elle est simplement fausse : un bin étroit y est un
+    // petit nombre de colonnes, et le mode Export ne pose jamais d'obstacle
+    // (Nesting.md:129 — « Aucun obstacle dans le bin »). Le recuit en serait
+    // perturbé pour rien, et l'obstacle occuperait une case que la grille compte
+    // déjà.
+    //
+    // ⚠️ La raison qui figurait ici — « la passe 2 refuse carrément de tourner »
+    // — n'est plus vraie depuis le 17-09-2026 : la passe 2 cesse de refuser et
+    // respecte désormais les zones interdites. L'écart A0 / tuilage reste, mais
+    // il ne tient plus à un refus.
     const double binWidthPx = binWidthMm * kMmToPx;
     const bool   isA0       = (binWidthMm <= 841.0) && (columns < 1);
     const double obsWPx     = isA0 ? 210.0 * kMmToPx : 0.0;
     const double obsHPx     = isA0 ? 297.0 * kMmToPx : 0.0;
 
-    Bin bin(binWidthPx, kMarginMm * kMmToPx, obsWPx, obsHPx);
+    // ── Les pages interdites ──────────────────────────────────────────────
+    //
+    // Une case de la grille nommée par l'appelant devient une zone interdite du
+    // Bin — la même mécanique que l'obstacle A4, sans le coin ni la taille
+    // figée. Le moteur doit alors poser toutes les pièces ailleurs, ou échouer :
+    // c'est cet échec, et le nombre de feuilles imprimées, que l'instrument
+    // chiffre — avant qu'Ostara n'écrive la boucle qui s'en servira.
+    std::vector<Bin::Zone> zones;
+    if (!ParseZones(zoneSpec, binWidthPx, columns, frameHeightMm, zones))
+    {
+        return 2;
+    }
+
+    if (!zones.empty())
+    {
+        std::printf("pages interdites : %s  (%zu cases)\n",
+                    qPrintable(zoneSpec), zones.size());
+        for (std::size_t i = 0; i < zones.size(); ++i)
+        {
+            const Bin::Zone &z = zones[i];
+            std::printf("  zone %zu : x=%.2f y=%.2f  %.2f x %.2f mm\n", i + 1,
+                        z.x / kMmToPx, z.y / kMmToPx,
+                        z.width / kMmToPx, z.height / kMmToPx);
+        }
+    }
+
+    // L'obstacle A4 et les pages interdites ne se cumulent pas : le premier est
+    // un cas non tuilé, les secondes exigent une grille. Le constructeur qui
+    // reçoit une liste explicite ne pose donc rien au coin.
+    const Bin bin = zones.empty()
+        ? Bin(binWidthPx, kMarginMm * kMmToPx, obsWPx, obsHPx)
+        : Bin(binWidthPx, kMarginMm * kMmToPx, std::move(zones));
 
     Engine::Config cfg;
     cfg.gap = gapMm * kMmToPx;
@@ -355,11 +464,70 @@ int main(int argc, char *argv[])
         cfg.artboardHeight = frameHeightMm * kMmToPx;
     }
 
-    Engine engine(cfg);
+    // ── Le moteur ─────────────────────────────────────────────────────────
+    //
+    // `bande` (défaut) est le moteur historique : il minimise une HAUTEUR, la
+    // page n'existe pas pour lui, et la grille est une grille posée après coup
+    // sur le résultat.
+    //
+    // `tiled` est le second moteur : il paie en PAGES. Les grosses pièces
+    // d'abord, puis les petites glissées dans les trous au VRAI CONTOUR — c'est
+    // l'imbrication dans le creux d'une courbe qui rend la place. Il n'ouvre
+    // une rangée que lorsqu'aucune pièce restante n'entre dedans.
+    const bool useTiled =
+        (engineSpec.compare(QLatin1String("tiled"), Qt::CaseInsensitive) == 0);
 
-    const auto t0 = std::chrono::steady_clock::now();
-    const std::vector<Placement> placements = engine.place(bin, fp.polygons);
-    const auto t1 = std::chrono::steady_clock::now();
+    if (!engineSpec.isEmpty() && !useTiled
+        && engineSpec.compare(QLatin1String("bande"), Qt::CaseInsensitive) != 0)
+    {
+        std::fprintf(stderr, "Moteur inconnu : « %s » (attendu bande ou tiled).\n",
+                     qPrintable(engineSpec));
+        return 2;
+    }
+    if (useTiled && (columns < 1 || frameHeightMm <= 0.0))
+    {
+        std::fprintf(stderr, "Le moteur tiled exige <colonnes> et <hauteur_cadre_mm>.\n");
+        return 2;
+    }
+
+    std::vector<Placement> placements;
+    std::chrono::steady_clock::time_point t0, t1;
+
+    if (useTiled)
+    {
+        TiledEngine::Spec spec;
+        spec.sheetWidth    = binWidthPx / columns;
+        spec.sheetHeight   = frameHeightMm * kMmToPx;
+        spec.gap           = gapMm * kMmToPx;
+        spec.allowRotation = true;
+
+        // Les deux surfaces et les deux planchers — les chiffres de Sophie.
+        const TiledEngine::Floors fl = TiledEngine::ComputeFloors(fp.polygons, spec);
+        const double kMm2 = kMmToPx * kMmToPx;
+
+        std::printf("moteur                 :    tiled\n");
+        std::printf("surface empreintes     : %10.1f mm2  (%8.1f cm2)\n",
+                    fl.footprintArea / kMm2, fl.footprintArea / kMm2 / 100.0);
+        std::printf("surface holders        : %10.1f mm2  (%8.1f cm2)\n",
+                    fl.holderArea / kMm2, fl.holderArea / kMm2 / 100.0);
+        std::printf("marge (holders - empr.) : %9.1f mm2  (%8.1f cm2)\n",
+                    fl.margin / kMm2, fl.margin / kMm2 / 100.0);
+        std::printf("plancher de feuilles   : %6d   (surface des empreintes — optimiste)\n",
+                    fl.footprintSheets);
+        std::printf("plancher des holders   : %6d   (surface des holders — realiste)\n",
+                    fl.holderSheets);
+
+        t0 = std::chrono::steady_clock::now();
+        placements = TiledEngine(spec).place(bin, fp.polygons);
+        t1 = std::chrono::steady_clock::now();
+    }
+    else
+    {
+        const Engine engine(cfg);
+        t0 = std::chrono::steady_clock::now();
+        placements = engine.place(bin, fp.polygons);
+        t1 = std::chrono::steady_clock::now();
+    }
 
     // ── 2 bis. Un plan incomplet ne se mesure pas ─────────────────────────
     //

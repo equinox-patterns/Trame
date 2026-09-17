@@ -23,128 +23,95 @@
 
 namespace {
 
-constexpr double kPi = 3.14159265358979323846;
-
 // A very large double returned when placement fails for a given arrangement.
 constexpr double kBadHeight = 1e12;
 
-// ── Bounding box ─────────────────────────────────────────────────────────
-// BBox is declared in Engine.h (shared with the member precomputed geometry).
-
-BBox bboxFromPath(const Clipper2Lib::Path64 &path)
-{
-    BBox b = {(std::numeric_limits<int64_t>::max)(),
-              (std::numeric_limits<int64_t>::max)(),
-              (std::numeric_limits<int64_t>::min)(),
-              (std::numeric_limits<int64_t>::min)()};
-    for (const auto &p : path) {
-        if (p.x < b.xMin) b.xMin = p.x;
-        if (p.y < b.yMin) b.yMin = p.y;
-        if (p.x > b.xMax) b.xMax = p.x;
-        if (p.y > b.yMax) b.yMax = p.y;
-    }
-    return b;
-}
-
-// ── Geometry helpers ──────────────────────────────────────────────────────
-
-Clipper2Lib::Path64 makeRect(int64_t x0, int64_t y0, int64_t x1, int64_t y1)
-{
-    Clipper2Lib::Path64 r;
-    r.reserve(4);
-    r.push_back({x0, y0});
-    r.push_back({x1, y0});
-    r.push_back({x1, y1});
-    r.push_back({x0, y1});
-    return r;
-}
-
-Clipper2Lib::Path64 translatePath(const Clipper2Lib::Path64 &path,
-                                  int64_t dx, int64_t dy)
-{
-    Clipper2Lib::Path64 out;
-    out.reserve(path.size());
-    for (const auto &p : path)
-        out.push_back({p.x + dx, p.y + dy});
-    return out;
-}
-
-/// Translate every path in a Paths64 collection.
-Clipper2Lib::Paths64 translatePaths(const Clipper2Lib::Paths64 &paths,
-                                    int64_t dx, int64_t dy)
-{
-    Clipper2Lib::Paths64 out;
-    out.reserve(paths.size());
-    for (const auto &p : paths)
-        out.push_back(translatePath(p, dx, dy));
-    return out;
-}
-
-/// Find the vertex with minimum Y (tie-break by minimum X) in a set of paths.
-/// Ignores empty sub-paths. Returns {0, INT64_MAX} if the region is empty.
-Clipper2Lib::Point64 findBottomLeft(const Clipper2Lib::Paths64 &paths)
-{
-    Clipper2Lib::Point64 best = {int64_t(0), (std::numeric_limits<int64_t>::max)()};
-    for (const auto &path : paths) {
-        if (path.empty())
-            continue;
-        for (const auto &p : path) {
-            if (p.y < best.y || (p.y == best.y && p.x < best.x))
-                best = p;
-        }
-    }
-    return best;
-}
-
-/// Conservative check: can the NFP of placed piece A (at px,py) possibly
-/// intersect the IFP rectangle [ifpX0,ifpX1]×[ifpY0,∞)?
-inline bool nfpOutsideIFP(const BBox &bboxA, const BBox &bboxB,
-                          int64_t px, int64_t py,
-                          int64_t ifpX0, int64_t ifpX1, int64_t ifpY0)
-{
-    const int64_t nfpMaxX = px + bboxA.xMax - bboxB.xMin;
-    const int64_t nfpMinX = px + bboxA.xMin - bboxB.xMax;
-    const int64_t nfpMaxY = py + bboxA.yMax - bboxB.yMin;
-
-    return nfpMaxY <= ifpY0
-        || nfpMaxX <= ifpX0
-        || nfpMinX >= ifpX1;
-}
-
 } // anonymous namespace
 
-// ── Engine: geometry utilities ───────────────────────────────────────────────
+// ── Shared geometry ──────────────────────────────────────────────────────────
+//
+// Le noyau géométrique — boîtes, rectangles, translations, rotations, NFP,
+// région faisable — vit dans `nesting/NestGeom.h` depuis qu'un SECOND moteur
+// est né : le moteur Tiled, qui paie en pages et non en hauteur, et qui a
+// besoin du même noyau. Le recopier aurait été deux vérités pour une règle.
+//
+// Ces déclarations ramènent sous les noms nus que ce fichier employait avant
+// l'extraction. **Aucun site d'appel ne bouge** : le diff se relit comme un
+// déplacement pur, pas comme une réécriture.
+using NestGeom::kScale;
+using NestGeom::bboxFromPath;
+using NestGeom::makeRect;
+using NestGeom::translatePath;
+using NestGeom::translatePaths;
+using NestGeom::rotatePath;
+using NestGeom::negatePath;
+using NestGeom::findBottomLeft;
+using NestGeom::nfpOutsideIFP;
+using NestGeom::ensureCCW;
 
-Clipper2Lib::Path64 Engine::rotatePath(const Clipper2Lib::Path64 &path,
-                                       double degrees)
+// ── Forbidden zones ──────────────────────────────────────────────────────────
+
+std::vector<Engine::ZoneGeom> Engine::buildZoneGeom(const Bin &bin, int64_t gapScaled)
 {
-    if (path.empty())
-        return {};
+    std::vector<ZoneGeom> out;
+    out.reserve(bin.zones().size());
 
-    const double rad = degrees * kPi / 180.0;
-    const double c   = std::cos(rad);
-    const double s   = std::sin(rad);
+    for (const Bin::Zone &z : bin.zones())
+    {
+        if (z.width <= 0.0 || z.height <= 0.0)
+            continue;
 
-    Clipper2Lib::Path64 out;
-    out.reserve(path.size());
+        const int64_t x0 = static_cast<int64_t>(z.x * kScale);
+        const int64_t y0 = static_cast<int64_t>(z.y * kScale);
+        const Clipper2Lib::Path64 raw =
+            makeRect(x0, y0,
+                     x0 + static_cast<int64_t>(z.width  * kScale),
+                     y0 + static_cast<int64_t>(z.height * kScale));
 
-    for (const auto &p : path) {
-        out.push_back({
-            static_cast<int64_t>(std::round(p.x * c - p.y * s)),
-            static_cast<int64_t>(std::round(p.x * s + p.y * c))
-        });
+        // Normalize, exactly as the A0 obstacle always was. The NFP is then
+        // cached on this local geometry and merely translated to the origin
+        // below, so moving a zone costs nothing and two zones can never be
+        // confused for one another.
+        const BBox rawBB = bboxFromPath(raw);
+
+        ZoneGeom g;
+        g.local     = translatePath(raw, -rawBB.xMin, -rawBB.yMin);
+        g.bboxLocal = bboxFromPath(g.local);   // BEFORE inflation — see the header
+        g.originX   = rawBB.xMin;
+        g.originY   = rawBB.yMin;
+
+        // Inflated by the FULL gap, exactly like the placed pieces — see the
+        // note on gapRadius. Halving it here would leave a piece only gap/2
+        // clear of a forbidden page, the same defect in a second place.
+        if (gapScaled > 0)
+        {
+            auto inflated = Clipper2Lib::InflatePaths({g.local}, gapScaled,
+                Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
+            if (!inflated.empty())
+                g.local = inflated[0];
+        }
+
+        out.push_back(std::move(g));
     }
 
     return out;
 }
 
-Clipper2Lib::Path64 Engine::negatePath(const Clipper2Lib::Path64 &path)
+Clipper2Lib::Paths64 Engine::absoluteZonePaths(const std::vector<ZoneGeom> &zones)
 {
-    Clipper2Lib::Path64 out;
-    out.reserve(path.size());
-    for (const auto &p : path)
-        out.push_back({-p.x, -p.y});
-    return out;
+    Clipper2Lib::Paths64 subjects;
+    subjects.reserve(zones.size());
+
+    for (const ZoneGeom &z : zones)
+        subjects.push_back(translatePath(z.local, z.originX, z.originY));
+
+    if (subjects.empty())
+        return {};
+
+    // One region rather than a list the caller has to reason about: two zones
+    // that overlap are one hole, and the fill rule should not be the thing that
+    // says so.
+    return Clipper2Lib::Union(subjects, Clipper2Lib::FillRule::NonZero);
 }
 
 // ── Sequential placement ─────────────────────────────────────────────────────
@@ -153,6 +120,7 @@ double Engine::placeSequential(const Bin &bin,
                                const std::vector<std::vector<RotGeom>> &rotBank,
                                NFPCache &nfpCache,
                                NFPCache &obstacleCache,
+                               const std::vector<ZoneGeom> &zones,
                                const std::vector<int> &rotIdx,
                                const std::vector<int> &order,
                                std::vector<Placement> &out,
@@ -175,38 +143,28 @@ double Engine::placeSequential(const Bin &bin,
     std::vector<Placed> placed;
     placed.reserve(order.size());
 
-    // Obstacle (e.g. A4 zone at top-left) — treated as a pre-placed piece
-    // whose NFP is subtracted from the IFP of every new piece.
-    const bool hasObstacle = bin.obstacleWidthMm() > 0.0 && bin.obstacleHeightMm() > 0.0;
-    Clipper2Lib::Path64 obsPath;       // inflated obstacle, local coords
-    BBox obsBBoxLocal;
-    int64_t obsPx = 0, obsPy = 0;
-    if (hasObstacle) {
-        const int64_t obsW = static_cast<int64_t>(bin.obstacleWidthMm() * kScale);
-        const int64_t obsH = static_cast<int64_t>(bin.obstacleHeightMm() * kScale);
-        Clipper2Lib::Path64 raw = makeRect(margin, margin, margin + obsW, margin + obsH);
-        // Normalize
-        const BBox rawBB = bboxFromPath(raw);
-        Clipper2Lib::Path64 local = translatePath(raw, -rawBB.xMin, -rawBB.yMin);
-        obsBBoxLocal = bboxFromPath(local);
-        obsPx = margin;
-        obsPy = margin;
-        // Inflate by the FULL gap, exactly like the placed pieces below — see
-        // the note on gapRadius. Halving it here would leave the piece only
-        // gap/2 clear of the obstacle, the same defect in a second place.
-        const int64_t obsGap = static_cast<int64_t>(m_config.gap * kScale);
-        if (obsGap > 0) {
-            auto inflated = Clipper2Lib::InflatePaths({local}, obsGap,
-                Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
-            obsPath = (!inflated.empty()) ? inflated[0] : local;
-        } else {
-            obsPath = local;
-        }
-    }
+    // Forbidden zones — the A0 sheet emulation at the top-left corner, and the
+    // pages a tiled plan must not print on. Each is treated as a pre-placed
+    // piece whose NFP is subtracted from the IFP of every new piece. The
+    // geometry arrives already built: this function runs once per annealing
+    // iteration, so building it here would pay for K inflations hundreds of
+    // times over (see buildZoneGeom).
 
-    int64_t maxYScaled = hasObstacle
-        ? (margin + static_cast<int64_t>(bin.obstacleHeightMm() * kScale))
-        : 0;
+    // The deepest zone floors the reported height: the A0 sheet sits at the
+    // corner, and a plan cannot be shorter than the sheet it was given.
+    //
+    // ⚠️ What this number IS, said plainly, because it is easy to over-read: it
+    // is only ever the annealing's cost, compared candidate against candidate —
+    // and the zone set is the same for the whole run, so it is a CONSTANT. It
+    // changes no result. Its one job is to let this function read the zones
+    // from a single place.
+    int64_t maxYScaled = 0;
+    for (const Bin::Zone &z : bin.zones())
+    {
+        const int64_t bottom = static_cast<int64_t>((z.y + z.height) * kScale);
+        if (bottom > maxYScaled)
+            maxYScaled = bottom;
+    }
 
     for (int orderIdx = 0; orderIdx < static_cast<int>(order.size()); ++orderIdx) {
         const int pieceIdx = order[orderIdx];
@@ -271,31 +229,45 @@ double Engine::placeSequential(const Bin &bin,
                 }
             }
 
-            // Subtract obstacle NFP (like a pre-placed piece at margin,margin).
-            // The obstacle NFP only depends on the current (piece, rotation):
-            // cached so it is not recomputed on every placement.
-            if (hasObstacle) {
-                const int64_t obsNfpMaxX = obsPx + obsBBoxLocal.xMax - bboxB.xMin;
-                const int64_t obsNfpMinX = obsPx + obsBBoxLocal.xMin - bboxB.xMax;
-                const int64_t obsNfpMaxY = obsPy + obsBBoxLocal.yMax - bboxB.yMin;
-                if (!(obsNfpMaxY <= ifpY0 || obsNfpMaxX <= ifpX0 || obsNfpMinX >= ifpX1)) {
-                    const NFPCacheKey okey = makeNFPCacheKey(pieceIdx, rIdx, 0, 0);
-                    const Clipper2Lib::Paths64 *nfpObsPtr = nullptr;
-                    auto oit = obstacleCache.find(okey);
-                    if (oit != obstacleCache.end()) {
-                        nfpObsPtr = &oit->second;
-                    } else {
-                        Clipper2Lib::Paths64 nfpObs =
-                            Clipper2Lib::MinkowskiSum(obsPath, bg.neg, true);
-                        for (auto &np : nfpObs) {
-                            if (Clipper2Lib::Area(np) < 0)
-                                std::reverse(np.begin(), np.end());
-                        }
-                        auto [ins, _] = obstacleCache.emplace(okey, std::move(nfpObs));
-                        nfpObsPtr = &ins->second;
+            // Subtract every forbidden zone's NFP (each like a pre-placed piece
+            // at its own place). Clipper64 unions its clips, which is exactly
+            // what "the piece must avoid all of them" means — the same property
+            // the placed pieces above already rely on.
+            //
+            // A zone's NFP only depends on the current (piece, rotation) AND on
+            // the zone, so the cache key carries the zone index. That is the
+            // first trap of this change stated as code: a key that reserved a
+            // single slot for "the obstacle" let two zones overwrite each
+            // other's NFP, and the second one to be asked won.
+            for (std::size_t zi = 0; zi < zones.size(); ++zi)
+            {
+                const ZoneGeom &z = zones[zi];
+
+                const int64_t zoneNfpMaxX = z.originX + z.bboxLocal.xMax - bboxB.xMin;
+                const int64_t zoneNfpMinX = z.originX + z.bboxLocal.xMin - bboxB.xMax;
+                const int64_t zoneNfpMaxY = z.originY + z.bboxLocal.yMax - bboxB.yMin;
+                if (zoneNfpMaxY <= ifpY0 || zoneNfpMaxX <= ifpX0 || zoneNfpMinX >= ifpX1)
+                    continue;
+
+                const NFPCacheKey zkey = makeNFPCacheKey(pieceIdx, rIdx,
+                                                         kZoneKeyTag,
+                                                         static_cast<int>(zi));
+                const Clipper2Lib::Paths64 *nfpZonePtr = nullptr;
+                auto zit = obstacleCache.find(zkey);
+                if (zit != obstacleCache.end()) {
+                    nfpZonePtr = &zit->second;
+                } else {
+                    Clipper2Lib::Paths64 nfpZone =
+                        Clipper2Lib::MinkowskiSum(z.local, bg.neg, true);
+                    for (auto &np : nfpZone) {
+                        if (Clipper2Lib::Area(np) < 0)
+                            std::reverse(np.begin(), np.end());
                     }
-                    clipper.AddClip(translatePaths(*nfpObsPtr, obsPx, obsPy));
+                    auto [ins, _] = obstacleCache.emplace(zkey, std::move(nfpZone));
+                    nfpZonePtr = &ins->second;
                 }
+
+                clipper.AddClip(translatePaths(*nfpZonePtr, z.originX, z.originY));
             }
 
             clipper.Execute(Clipper2Lib::ClipType::Difference,
@@ -349,6 +321,7 @@ void Engine::anneal(const Bin &bin,
                     const std::vector<std::vector<RotGeom>> &rotBank,
                     NFPCache &nfpCache,
                     NFPCache &obstacleCache,
+                    const std::vector<ZoneGeom> &zones,
                     std::vector<Placement> &best,
                     int64_t infY) const
 {
@@ -373,7 +346,7 @@ void Engine::anneal(const Bin &bin,
     }
 
     std::vector<Placement> current;
-    double bestHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache,
+    double bestHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache, zones,
                                         rotIdx, order, current, infY);
     best = current;
 
@@ -405,7 +378,7 @@ void Engine::anneal(const Bin &bin,
         }
 
         std::vector<Placement> neighbor;
-        double newHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache,
+        double newHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache, zones,
                                            newRot, newOrder, neighbor, infY);
 
         const double delta = newHeight - bestHeight;
@@ -449,68 +422,33 @@ std::vector<Placement> Engine::place(const Bin &bin,
     assert(m_config.coolingRate > 0.0 && m_config.coolingRate < 1.0
            && "coolingRate must be in (0, 1)");
 
-    // Normalize all contours to local coordinates.
-    std::vector<Clipper2Lib::Path64> local(N);
-    for (int i = 0; i < N; ++i) {
-        const BBox bb = bboxFromPath(pieces[i]);
-        local[i] = translatePath(pieces[i], -bb.xMin, -bb.yMin);
-    }
-
     const int numRots = m_config.freeRotation
         ? static_cast<int>(360.0 / m_config.rotationStep)
         : 1;
 
-    // Helper: ensure a path is CCW (positive signed area) for Clipper2 conventions.
-    // Clipper2 MinkowskiSum expects CCW for the first path.
-    auto ensureCCW = [](Clipper2Lib::Path64 &p) {
-        if (Clipper2Lib::Area(p) < 0)
-            std::reverse(p.begin(), p.end());
-    };
-
-    // The gap is the CLEAR DISTANCE held between two pieces, so the reference is
-    // inflated by the full gap — not by half of it.
+    // Contours ramenés sur leur propre coin min, puis banque de rotations.
     //
-    // The NFP is MinkowskiSum(A_inflated, -B): it forbids every position where
-    // the inflated A would meet B. Inflating by gap/2 therefore only ever
-    // guaranteed gap/2 on the floor, which is what this code did until the
-    // clearances were actually measured (Trame/tests/gapbench.cpp) — a nesting
-    // asked for 5 mm was delivering 2.5 mm.
-    //
-    // The two-sided scheme (A and B each grown by gap/2) describes the very same
-    // forbidden region, since MinkowskiSum(A⊕g/2, -(B⊕g/2)) equals
-    // MinkowskiSum(A⊕g, -B). One inflation instead of two, for the same
-    // geometry.
-    const int64_t gapRadius = static_cast<int64_t>(m_config.gap * kScale);
+    // Les deux règles qui vivaient ici — le gonflement au jeu ENTIER (jamais la
+    // moitié, qui ne rendait que gap/2 sur le plancher avant que les dégagements
+    // soient mesurés le 15-09) et le fait que les NFP gardent le polygone
+    // complet pour que les concavités restent exploitables — sont écrites à
+    // côté du code qui les applique, dans `nesting/NestGeom.h`. Elles valent
+    // désormais pour les DEUX moteurs.
+    const std::vector<Clipper2Lib::Path64> local = NestGeom::normalizeToLocal(pieces);
+    const std::vector<std::vector<RotGeom>> rotBank =
+        NestGeom::buildRotBank(local, m_config.rotationStep, numRots,
+                               static_cast<int64_t>(m_config.gap * kScale));
 
-    // Rotation bank — one RotGeom per (piece, rotation): the full CCW path and
-    // every geometry that only depends on it (bbox, negated path, gap-inflated
-    // reference). Previously bbox/neg/inflation were recomputed identically on
-    // every placement / NFP cache miss. NFPs still use the full polygon so
-    // concavities stay exploitable.
-    std::vector<std::vector<RotGeom>> rotBank(N);
-    for (int i = 0; i < N; ++i) {
-        rotBank[i].reserve(numRots);
-        for (int r = 0; r < numRots; ++r) {
-            RotGeom g;
-            g.path = rotatePath(local[i], r * m_config.rotationStep);
-            ensureCCW(g.path);
-            g.bbox = bboxFromPath(g.path);
-            g.neg  = negatePath(g.path);
-            if (gapRadius > 0) {
-                auto inflated = Clipper2Lib::InflatePaths({g.path}, gapRadius,
-                    Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
-                g.aref = (!inflated.empty()) ? inflated[0] : g.path;
-            } else {
-                g.aref = g.path;
-            }
-            rotBank[i].push_back(std::move(g));
-        }
-    }
+    // The bin's forbidden zones, as engine geometry, built ONCE for the whole
+    // run: the annealing below calls placeSequential hundreds of times, and
+    // rebuilding K inflations on each of those calls is what this avoids.
+    const std::vector<ZoneGeom> zones =
+        buildZoneGeom(bin, static_cast<int64_t>(m_config.gap * kScale));
 
     NFPCache nfpCache;
     nfpCache.reserve(std::size_t(N) * numRots * 4);
-    NFPCache obstacleCache; // keyed (piece, rot); obstacle NFP independent of context
-    obstacleCache.reserve(std::size_t(N) * numRots);
+    NFPCache obstacleCache; // keyed (piece, rot, zone); a zone NFP is independent of context
+    obstacleCache.reserve(std::size_t(N) * numRots * std::max<std::size_t>(zones.size(), 1));
 
     // Safe height sentinel: sum of piece heights (rotation 0) + 50% margin.
     int64_t totalH = 0;
@@ -524,7 +462,7 @@ std::vector<Placement> Engine::place(const Bin &bin,
     const int64_t infY = totalH > 0 ? totalH : kMaxSafe;
 
     std::vector<Placement> best;
-    anneal(bin, rotBank, nfpCache, obstacleCache, best, infY);
+    anneal(bin, rotBank, nfpCache, obstacleCache, zones, best, infY);
 
     // The adjustment pass — strictly after the search, never inside it. The
     // grid is read here and nowhere else: the annealing above runs exactly as

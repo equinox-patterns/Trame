@@ -43,6 +43,10 @@ using Clipper2Lib::Path64;
 using Clipper2Lib::Paths64;
 using Clipper2Lib::Point64;
 
+/// L'échelle du point fixe, désormais partagée par les deux moteurs — elle
+/// vivait sur `Engine` avant que le noyau géométrique parte dans NestGeom.h.
+using NestGeom::kScale;
+
 BBox BBoxOf(const Path64 &path)
 {
     BBox b{0, 0, 0, 0};
@@ -126,14 +130,6 @@ void Engine::refine(const Bin &bin,
         }
     }
 
-    // The obstacle geometry lives inside placeSequential and is not reachable
-    // here. No Ostara run sets one, so this costs nothing today — and refusing
-    // is the only honest option rather than guessing where the obstacle is.
-    if (bin.obstacleWidthMm() > 0.0 || bin.obstacleHeightMm() > 0.0)
-    {
-        return;
-    }
-
     const int64_t binW   = static_cast<int64_t>(bin.widthMm() * kScale);
     const int64_t margin = static_cast<int64_t>(bin.marginMm() * kScale);
     const int64_t gapR   = static_cast<int64_t>(m_config.gap * kScale);
@@ -144,6 +140,18 @@ void Engine::refine(const Bin &bin,
     {
         return;
     }
+
+    // What the first pass kept clear, this pass must keep clear too — every
+    // forbidden zone, at its absolute place, joined into one region. The same
+    // builder the first pass uses, so the two passes cannot disagree about
+    // where a forbidden page is (see Engine::buildZoneGeom).
+    //
+    // This used to be impossible: the zone geometry lived inside
+    // placeSequential and was not reachable here, so the pass refused to run at
+    // all as soon as the bin carried an obstacle. The refusal is gone with the
+    // reachability — and it was the obstacle-plus-grid combination, the one a
+    // tiled plan with forbidden pages needs, that it made unreachable.
+    const Clipper2Lib::Paths64 forbidden = absoluteZonePaths(buildZoneGeom(bin, gapR));
 
     // The envelope comes from the very number the host application stores and
     // turns into a page count — never from a local recomputation, which would
@@ -294,6 +302,29 @@ void Engine::refine(const Bin &bin,
             if (out[k].y + g.yMin < margin)
             {
                 return {};
+            }
+        }
+
+        // …nor into a page this run must not print on.
+        //
+        // The question is asked of the CONTOUR, not of the bounding box. A
+        // rotated piece's box is far larger than the piece, and refusing on the
+        // box would deny a place the first pass itself allowed — the mistake
+        // already paid for once, on this canvas, when the holder clamped on its
+        // rectangle and pushed back a piece that was perfectly inside the plan.
+        //
+        // This is the only place the test is needed: rIdx[i] is set BEFORE the
+        // deltas are built, and this lambda reads rotBank[k][rIdx[k]] — so a
+        // rotation candidate goes through here exactly like a translation.
+        if (!forbidden.empty())
+        {
+            for (const std::size_t k : block)
+            {
+                if (!Clipper2Lib::Intersect({contourAt(k, out[k])}, forbidden,
+                                            Clipper2Lib::FillRule::NonZero).empty())
+                {
+                    return {};
+                }
             }
         }
 
@@ -496,6 +527,22 @@ void Engine::refine(const Bin &bin,
                                                        {contourAt(b, pos[b])},
                                                        Clipper2Lib::FillRule::NonZero);
             if (!hit.empty())
+            {
+                best = start;
+                return;
+            }
+        }
+    }
+
+    // The same promise, asked about the forbidden zones — a piece sitting on a
+    // page this run must not print on is the same class of wrong as two pieces
+    // in one place, and the pass is the last place it can be caught.
+    if (!forbidden.empty())
+    {
+        for (std::size_t a = 0; a < n; ++a)
+        {
+            if (!Clipper2Lib::Intersect({contourAt(a, pos[a])}, forbidden,
+                                        Clipper2Lib::FillRule::NonZero).empty())
             {
                 best = start;
                 return;

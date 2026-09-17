@@ -23,14 +23,9 @@
 #include <clipper2/clipper.minkowski.h>
 
 #include "model/Placement.h"
+#include "nesting/NestGeom.h"
 
 class Bin;
-
-/// Axis-aligned bounding box in Clipper integer coordinates.
-struct BBox
-{
-    int64_t xMin, yMin, xMax, yMax;
-};
 
 /// Nesting engine — places pieces in a strip bin via NFP + simulated annealing.
 ///
@@ -112,24 +107,53 @@ public:
 private:
     // ── Precomputed per-(piece, rotation) geometry ───────────────────────
 
-    /// Everything that only depends on (piece, rotation) is computed once in
-    /// place() and reused across every annealing iteration. Previously these
-    /// were recomputed identically on each NFP cache miss / each placement.
-    struct RotGeom
+    /// `RotGeom` et le noyau géométrique (rotations, boîtes, NFP) vivent
+    /// désormais dans `nesting/NestGeom.h` : un SECOND moteur est né, le moteur
+    /// Tiled, et il a besoin du même noyau. Le recopier aurait été deux vérités
+    /// pour une règle.
+    using RotGeom = NestGeom::RotGeom;
+
+    // ── Forbidden zones ──────────────────────────────────────────────────
+
+    /// One of the bin's zones, as engine geometry.
+    ///
+    /// Normalized to its own min corner so that the per-(piece, rotation) NFP
+    /// can be cached on it and merely translated to (originX, originY): a zone's
+    /// place is then free to change without touching the cache.
+    struct ZoneGeom
     {
-        Clipper2Lib::Path64 path;  ///< full rotated path, CCW
-        Clipper2Lib::Path64 neg;   ///< negatePath(path)
-        Clipper2Lib::Path64 aref;  ///< gap-inflated reference (== path when no inflation)
-        BBox                 bbox;
+        Clipper2Lib::Path64 local;      ///< The zone, gap-inflated, normalized
+
+        /// Bounding box of the zone BEFORE inflation — the figure the
+        /// "can this zone possibly matter" test reads. Kept exactly as the A0
+        /// obstacle had it: the test is a conservative filter, and widening it
+        /// would change when a clip is skipped.
+        BBox bboxLocal;
+
+        int64_t originX = 0;  ///< Where the local min corner sits in the bin
+        int64_t originY = 0;
     };
 
-    // ── Geometry utilities (Clipper2 integer coordinates) ────────────────
+    /// Marks the third 16-bit field of an obstacle-cache key as a ZONE index
+    /// rather than a piece index.
+    ///
+    /// The key has four fields and the obstacle NFP only ever used two of them,
+    /// which is why a single slot could not tell two zones apart — the note in
+    /// placeSequential calls that out as the first trap of this change.
+    static constexpr int kZoneKeyTag = 0xFFFF;
 
-    static constexpr double kScale = 1e6;
+    /// The bin's forbidden zones as engine geometry, built ONCE per run.
+    ///
+    /// Each zone comes back as its rectangle at its own place, normalized and
+    /// then inflated by the FULL gap. Rebuilding this inside placeSequential —
+    /// which runs once per annealing iteration, hundreds of times per run — was
+    /// free for one rectangle and is not for K.
+    static std::vector<ZoneGeom> buildZoneGeom(const Bin &bin, int64_t gapScaled);
 
-    static Clipper2Lib::Path64 rotatePath(const Clipper2Lib::Path64 &path,
-                                          double degrees);
-    static Clipper2Lib::Path64 negatePath(const Clipper2Lib::Path64 &path);
+    /// The same zones at their absolute places, joined into one region.
+    ///
+    /// One geometry, for a pass that only ever asks "may this piece be here".
+    static Clipper2Lib::Paths64 absoluteZonePaths(const std::vector<ZoneGeom> &zones);
 
     // ── Placement ────────────────────────────────────────────────────────
 
@@ -143,6 +167,7 @@ private:
                            const std::vector<std::vector<RotGeom>> &rotBank,
                            NFPCache &nfpCache,
                            NFPCache &obstacleCache,
+                           const std::vector<ZoneGeom> &zones,
                            const std::vector<int> &rotIdx,
                            const std::vector<int> &order,
                            std::vector<Placement> &out,
@@ -154,6 +179,7 @@ private:
                 const std::vector<std::vector<RotGeom>> &rotBank,
                 NFPCache &nfpCache,
                 NFPCache &obstacleCache,
+                const std::vector<ZoneGeom> &zones,
                 std::vector<Placement> &best,
                 int64_t infY) const;
 

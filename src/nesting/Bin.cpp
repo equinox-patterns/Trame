@@ -15,9 +15,10 @@
 #include "Bin.h"
 
 #include <cassert>
+#include <utility>
 
 Bin::Bin(double widthMm, double marginMm,
-         double obstacleWidthMm, double obstacleHeightMm) noexcept
+         double obstacleWidthMm, double obstacleHeightMm)
     : m_widthMm(widthMm)
     , m_marginMm(marginMm)
     , m_obstacleWidthMm(obstacleWidthMm)
@@ -27,4 +28,27 @@ Bin::Bin(double widthMm, double marginMm,
     assert(marginMm >= 0.0 && "Bin margin must be non-negative");
     assert(obstacleWidthMm >= 0.0 && "Obstacle width must be non-negative");
     assert(obstacleHeightMm >= 0.0 && "Obstacle height must be non-negative");
+
+    // The engine has always read the obstacle's two dimensions as a conjunction
+    // — an obstacle of null width is no obstacle — and the zone list keeps that
+    // reading rather than inventing a second one.
+    if (obstacleWidthMm > 0.0 && obstacleHeightMm > 0.0)
+    {
+        m_zones.push_back(Zone{marginMm, marginMm, obstacleWidthMm, obstacleHeightMm});
+    }
+}
+
+Bin::Bin(double widthMm, double marginMm, std::vector<Zone> zones)
+    : m_widthMm(widthMm)
+    , m_marginMm(marginMm)
+    , m_zones(std::move(zones))
+{
+    assert(widthMm > 0.0 && "Bin width must be positive");
+    assert(marginMm >= 0.0 && "Bin margin must be non-negative");
+
+    for (const Zone &z : m_zones)
+    {
+        assert(z.width >= 0.0 && "Zone width must be non-negative");
+        assert(z.height >= 0.0 && "Zone height must be non-negative");
+    }
 }
