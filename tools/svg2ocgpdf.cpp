@@ -14,6 +14,7 @@
 
 #include <QApplication>
 #include <QFileInfo>
+#include <QStringList>
 
 #include "pdf/SvgToOcgPdf.h"
 
@@ -21,24 +22,44 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
 
-    if (argc < 2) {
-        qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf]";
+    QStringList args;
+    args.reserve(argc);
+    for (int i = 1; i < argc; ++i)
+        args.append(QString::fromLocal8Bit(argv[i]));
+
+    // The underlay: a second document, drawn on every page under the layers and outside
+    // every optional content group. Optional here, and named rather than positional, so
+    // that an existing command line keeps its meaning.
+    QString underlayPath;
+    const int underlayAt = args.indexOf(QStringLiteral("--underlay"));
+    if (underlayAt >= 0) {
+        if (underlayAt + 1 >= args.size()) {
+            qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]";
+            return 1;
+        }
+        underlayPath = args.at(underlayAt + 1);
+        args.removeAt(underlayAt + 1);
+        args.removeAt(underlayAt);
+    }
+
+    if (args.isEmpty()) {
+        qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]";
         return 1;
     }
 
-    const QString svgPath = QString::fromLocal8Bit(argv[1]);
+    const QString svgPath = args.at(0);
     const QFileInfo fi(svgPath);
 
     QString pdfPath;
-    if (argc >= 3) {
-        pdfPath = QString::fromLocal8Bit(argv[2]);
+    if (args.size() >= 2) {
+        pdfPath = args.at(1);
     } else {
         pdfPath = fi.absolutePath() + QLatin1Char('/')
                   + fi.completeBaseName() + QStringLiteral("_ocg.pdf");
     }
 
     SvgToOcgPdf converter;
-    if (!converter.convert(svgPath, pdfPath)) {
+    if (!converter.convert(svgPath, pdfPath, {}, underlayPath)) {
         qWarning() << "Conversion failed";
         return 1;
     }

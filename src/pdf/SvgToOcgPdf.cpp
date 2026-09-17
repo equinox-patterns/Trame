@@ -237,12 +237,13 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info)
+bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
+                          const DocumentInfo &info, const QString &underlaySvgPath)
 {
     // One page, and the document is that page: the rectangle covers everything the SVG
     // draws. This is what the svg2ocgpdf tool asks for, and it is the shape a single-size
     // run takes — a document with nothing to cut up is a document with one sheet.
-    const SvgContent doc = readSvg(svgPath);
+    const SvgContent doc = readSvg(svgPath, underlaySvgPath);
     if (!doc.ok)
         return false;
 
@@ -253,7 +254,8 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath, const 
 }
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
-                          const QString &pdfPath, const DocumentInfo &info)
+                          const QString &pdfPath, const DocumentInfo &info,
+                          const QString &underlaySvgPath)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: no page to write";
@@ -270,18 +272,20 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         }
     }
 
-    const SvgContent doc = readSvg(svgPath);
+    const SvgContent doc = readSvg(svgPath, underlaySvgPath);
     if (!doc.ok) {
         // An unreadable document is not a plan with one sheet missing: it is every sheet
         // wrong, because they all draw the same thing. Handing over nothing beats handing
-        // over a plan that cannot be reassembled.
+        // over a plan that cannot be reassembled. The underlay reads the same way, and for
+        // the same reason: it is on every sheet or on none.
         return false;
     }
 
     return buildOcgPdf(pdfPath, doc, pages, info);
 }
 
-SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath)
+SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
+                                              const QString &underlaySvgPath)
 {
     SvgContent result;
 
@@ -303,6 +307,15 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath)
     }
 
     result.page = getPageInfo(doc);
+
+    // The underlay is read before anything else is decided, and it is read for every path
+    // out of here — the layered document and the flat one alike. It is on every sheet or on
+    // none: a frame that made it onto half the paper would be worse than no export at all.
+    if (!underlaySvgPath.isEmpty()
+        && !readUnderlay(underlaySvgPath, result.page, result.underlay)) {
+        return result; // ok stays false
+    }
+
     const QVector<LayerEntry> layers = findLayers(doc);
 
     // No layer group at all: a single-size document. It is still owed a PDF — one plain
@@ -458,6 +471,50 @@ SvgToOcgPdf::PageInfo SvgToOcgPdf::getPageInfo(const QDomDocument &doc) const
     return info;
 }
 
+/// @brief A root for a document holding one drawing, laid out on the plan's own page.
+///
+/// Every drawing this module renders — each layer, and the underlay — is rendered this way,
+/// and they have to share it: they are placed on the paper through the same arithmetic, so
+/// a root that measured differently would put one of them off its sheets.
+static QDomElement makeSvgRoot(QDomDocument &doc, const QSizeF &sizeMm, const QRectF &viewBox)
+{
+    QDomElement svgRoot = doc.createElement(QStringLiteral("svg"));
+    svgRoot.setAttribute(QStringLiteral("xmlns"), QStringLiteral("http://www.w3.org/2000/svg"));
+    svgRoot.setAttribute(QStringLiteral("viewBox"),
+                         QStringLiteral("%1 %2 %3 %4")
+                             .arg(viewBox.x(), 0, 'f', 2)
+                             .arg(viewBox.y(), 0, 'f', 2)
+                             .arg(viewBox.width(), 0, 'f', 2)
+                             .arg(viewBox.height(), 0, 'f', 2));
+    svgRoot.setAttribute(QStringLiteral("width"),
+                         QStringLiteral("%1mm").arg(sizeMm.width(), 0, 'f', 4));
+    svgRoot.setAttribute(QStringLiteral("height"),
+                         QStringLiteral("%1mm").arg(sizeMm.height(), 0, 'f', 4));
+    return svgRoot;
+}
+
+/// @brief Drop every <text> descendant, before the drawing is rendered.
+///
+/// QSvgRenderer draws text with a font, and a form's resources carry none: the text would
+/// reach the page as a reference to a font that is not there. The shapes go through the
+/// renderer and the text comes back beside them as path operators.
+static void removeTextElements(QDomElement root)
+{
+    QVector<QDomElement> toRemove;
+    std::function<void(QDomElement)> walk = [&](QDomElement el) {
+        for (QDomElement child = el.firstChildElement(); !child.isNull();
+             child = child.nextSiblingElement()) {
+            if (child.tagName() == QStringLiteral("text"))
+                toRemove.append(child);
+            else
+                walk(child);
+        }
+    };
+    walk(root);
+    for (auto &el : toRemove)
+        el.parentNode().removeChild(el);
+}
+
 QByteArray SvgToOcgPdf::buildLayerSvg(const QDomDocument &origDoc,
                                        const QDomElement   &layerEl,
                                        const PageInfo      &page) const
@@ -469,44 +526,90 @@ QByteArray SvgToOcgPdf::buildLayerSvg(const QDomDocument &origDoc,
         QStringLiteral("xml"), QStringLiteral("version=\"1.0\" encoding=\"UTF-8\""));
     layerDoc.appendChild(pi);
 
-    QDomElement svgRoot = layerDoc.createElement(QStringLiteral("svg"));
-    svgRoot.setAttribute(QStringLiteral("xmlns"), QStringLiteral("http://www.w3.org/2000/svg"));
-    svgRoot.setAttribute(QStringLiteral("viewBox"),
-                         QStringLiteral("%1 %2 %3 %4")
-                             .arg(page.viewBox.x(), 0, 'f', 2)
-                             .arg(page.viewBox.y(), 0, 'f', 2)
-                             .arg(page.viewBox.width(), 0, 'f', 2)
-                             .arg(page.viewBox.height(), 0, 'f', 2));
-    svgRoot.setAttribute(QStringLiteral("width"),
-                         QStringLiteral("%1mm").arg(page.sizeMm.width(), 0, 'f', 4));
-    svgRoot.setAttribute(QStringLiteral("height"),
-                         QStringLiteral("%1mm").arg(page.sizeMm.height(), 0, 'f', 4));
+    QDomElement svgRoot = makeSvgRoot(layerDoc, page.sizeMm, page.viewBox);
 
-    // Deep-clone the layer element, stripping <text> elements if MEP
+    // Deep-clone the layer element; its text goes out and comes back as path operators.
     QDomNode cloned = layerDoc.importNode(layerEl, true);
-
-    // Remove <text> elements from the clone (they'll be rendered as paths)
-    auto removeTextElements = [](QDomElement root) {
-        QVector<QDomElement> toRemove;
-        std::function<void(QDomElement)> walk = [&](QDomElement el) {
-            for (QDomElement child = el.firstChildElement(); !child.isNull();
-                 child = child.nextSiblingElement()) {
-                if (child.tagName() == QStringLiteral("text"))
-                    toRemove.append(child);
-                else
-                    walk(child);
-            }
-        };
-        walk(root);
-        for (auto &el : toRemove)
-            el.parentNode().removeChild(el);
-    };
     removeTextElements(cloned.toElement());
 
     svgRoot.appendChild(cloned);
     layerDoc.appendChild(svgRoot);
 
     return layerDoc.toByteArray(-1); // -1 = no indent, compact XML
+}
+
+QByteArray SvgToOcgPdf::buildUnderlaySvg(const QDomDocument &origDoc, const PageInfo &page) const
+{
+    QDomDocument underlayDoc;
+
+    QDomNode pi = underlayDoc.createProcessingInstruction(
+        QStringLiteral("xml"), QStringLiteral("version=\"1.0\" encoding=\"UTF-8\""));
+    underlayDoc.appendChild(pi);
+
+    QDomElement svgRoot = makeSvgRoot(underlayDoc, page.sizeMm, page.viewBox);
+
+    // Every top-level child, not one group of them: an underlay is not authored with layer
+    // groups, and the namespaces the original root declared are no use to a document that
+    // carries nothing but plain SVG.
+    for (QDomElement child = origDoc.documentElement().firstChildElement(); !child.isNull();
+         child = child.nextSiblingElement()) {
+        svgRoot.appendChild(underlayDoc.importNode(child, true));
+    }
+    removeTextElements(svgRoot);
+
+    underlayDoc.appendChild(svgRoot);
+
+    return underlayDoc.toByteArray(-1);
+}
+
+bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
+                               Underlay &out)
+{
+    QFile file(svgPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        qWarning() << "SvgToOcgPdf: cannot open the underlay" << svgPath;
+        return false;
+    }
+    const QByteArray data = file.readAll();
+    file.close();
+
+    QDomDocument doc;
+    QString errorMsg;
+    int errorLine, errorCol;
+    if (!doc.setContent(data, &errorMsg, &errorLine, &errorCol)) {
+        qWarning() << "SvgToOcgPdf: XML parse error in the underlay at line" << errorLine
+                   << ":" << errorMsg;
+        return false;
+    }
+
+    // Drawn through the plan's own translation, so it has to be laid out to the plan's own
+    // figures. Read them and compare rather than assume: a frame authored at another size
+    // would land half off its sheets, and would say nothing.
+    const PageInfo own = getPageInfo(doc);
+    if (own.sizeMm != plan.sizeMm || own.viewBox != plan.viewBox) {
+        qWarning() << "SvgToOcgPdf: the underlay is not laid out like the plan —"
+                   << own.sizeMm << own.viewBox << "against" << plan.sizeMm << plan.viewBox;
+        return false;
+    }
+
+    const QByteArray pdfBuf = renderToPdfBuffer(buildUnderlaySvg(doc, plan), plan);
+    if (pdfBuf.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: failed to render the underlay";
+        return false;
+    }
+
+    out.stream = extractContentStream(pdfBuf);
+    if (out.stream.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: failed to extract the underlay stream";
+        return false;
+    }
+
+    // Its text goes the way the layout layer's text goes, and for the same reason: the
+    // renderer cannot draw it into a form that carries no font, so it is re-emitted here as
+    // path operators, in a scope of its own.
+    out.textStream = emitMepTextAsPdfOps(doc.documentElement(),
+                                         plan.sizeMm.height() * kPointsPerMm);
+    return true;
 }
 
 QByteArray SvgToOcgPdf::renderToPdfBuffer(const QByteArray &svgData,
@@ -1182,6 +1285,25 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         placement.f = kPixelToPt * plan.bottom();
     }
 
+    // The underlay is read on every page through the very translation the plan is read
+    // through, so it has to carry the plan's own placement. Read rather than assumed: a
+    // frame half a point off its sheets is a frame that does not close, and it would close
+    // no better for having been trusted.
+    if (!doc.underlay.stream.isEmpty()) {
+        Placement found;
+        if (!ReadPlacement(doc.underlay.stream, found)) {
+            qWarning() << "SvgToOcgPdf: no placement cm at the head of the underlay stream";
+        } else {
+            const auto differs = [](double x, double y) { return std::abs(x - y) > 1e-6; };
+            if (differs(found.a, placement.a) || differs(found.d, placement.d)
+                || differs(found.f, placement.f)) {
+                qWarning() << "SvgToOcgPdf: the underlay is placed unlike the plan:"
+                           << found.a << found.d << found.f << "against"
+                           << placement.a << placement.d << placement.f;
+            }
+        }
+    }
+
     if (placement.b != 0.0 || placement.c != 0.0) {
         // Nothing Qt has produced has a shear here, and the page arithmetic below does not
         // carry one. Say so rather than place pages as if it were zero.
@@ -1208,17 +1330,34 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
             .arg(placement.d * plan.top() + placement.f + kBleedPt, 0, 'f', 6)
             .toUtf8();
 
-    // One Form XObject per layer, written once and invoked by every page: the plan is in
+    // One Form XObject per drawing, written once and invoked by every page: the plan is in
     // the file a single time. It is also RENDERED a single time, and that is the other half
     // of the win — a document read once is M renders, where a page read its own copy was
     // N×M of them.
+    const auto makeForm = [&](const QByteArray &content) {
+        return addObject(
+            QStringLiteral(
+                "<< /Type /XObject /Subtype /Form\n"
+                "   /BBox [%1]\n"
+                "   /Resources <<\n"
+                "      /ExtGState << /GSa %2 0 R >>\n"
+                "      /ColorSpace << /CSp /DeviceRGB >>\n"
+                "   >>\n"
+                "   /Length %3 >>\n"
+                "stream\n"
+            ).arg(QString::fromUtf8(bbox)).arg(gsaObj).arg(content.size()).toUtf8()
+            + content
+            + "\nendstream");
+    };
+
     QVector<int> formObjs;
-    formObjs.reserve(drawing.size());
+    formObjs.reserve(drawing.size() + 1);
 
     for (const LayerContent *layer : drawing) {
-        // The decor arrives as two streams — the shapes QSvgRenderer drew, and the text
-        // this module re-emits as path operators — because they are converted by different
-        // hands and must not share a CTM. One form holds both, each in its own q/Q.
+        // The layout layer arrives as two streams — the shapes QSvgRenderer drew, and the
+        // text this module re-emits as path operators — because they are converted by
+        // different hands and must not share a CTM. One form holds both, each in its own
+        // q/Q.
         QByteArray content;
         if (layer->isMep) {
             content.append("q\n");
@@ -1233,19 +1372,28 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
             content.append(layer->stream);
         }
 
-        formObjs.append(addObject(
-            QStringLiteral(
-                "<< /Type /XObject /Subtype /Form\n"
-                "   /BBox [%1]\n"
-                "   /Resources <<\n"
-                "      /ExtGState << /GSa %2 0 R >>\n"
-                "      /ColorSpace << /CSp /DeviceRGB >>\n"
-                "   >>\n"
-                "   /Length %3 >>\n"
-                "stream\n"
-            ).arg(QString::fromUtf8(bbox)).arg(gsaObj).arg(content.size()).toUtf8()
-            + content
-            + "\nendstream"));
+        formObjs.append(makeForm(content));
+    }
+
+    // The underlay comes last among the forms and first in every page. It is written and
+    // rendered exactly once, like the layers; what sets it apart is where the page invokes
+    // it — beneath them, and outside every /OC block, so that no layer state can take it
+    // off the paper. Its index is therefore one past the last layer, which is the name the
+    // page stream below addresses it by.
+    int underlayFormIndex = -1;
+    if (!doc.underlay.isEmpty()) {
+        QByteArray content;
+        content.append("q\n");
+        content.append(doc.underlay.stream);
+        content.append("\nQ\n");
+        if (!doc.underlay.textStream.isEmpty()) {
+            content.append("q\n");
+            content.append(doc.underlay.textStream);
+            content.append("\nQ\n");
+        }
+
+        underlayFormIndex = formObjs.size();
+        formObjs.append(makeForm(content));
     }
 
     QVector<int> pageObjs;
@@ -1270,6 +1418,16 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                               .arg(dx, 0, 'f', 6)
                               .arg(dy, 0, 'f', 6)
                               .toUtf8());
+
+        // The underlay first, and in no /OC block: it is not a layer, so nothing in the
+        // reader's panel reaches it, and it lies under the drawing rather than over it.
+        // Invoked here, after the page's translation, it is in the plan's own frame — so
+        // each page shows of it exactly what falls inside the page, the same crop that
+        // decides what the page shows of the plan.
+        if (underlayFormIndex >= 0) {
+            streamData.append(
+                QStringLiteral("q\n/Fm%1 Do\nQ\n").arg(underlayFormIndex).toUtf8());
+        }
 
         for (int i = 0; i < drawing.size(); ++i) {
             const LayerContent *layer = drawing.at(i);
@@ -1399,6 +1557,9 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                     .arg(placement.a * pages.first().width(), 0, 'f', 2)
                     .arg(-placement.d * pages.first().height(), 0, 'f', 2);
     qDebug() << "  Forms:" << formObjs.size() << "— the plan is written and rendered once";
+    if (underlayFormIndex >= 0) {
+        qDebug() << "  Underlay: on every page, under every layer, in no layer group";
+    }
     if (withOcg) {
         qDebug() << "  OCG layers:" << sizeLayers.size()
                    << "+ decor:" << (mepLayer != nullptr ? 1 : 0);

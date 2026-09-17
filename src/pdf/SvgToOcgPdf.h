@@ -47,7 +47,8 @@ public:
         QString producer;  ///< the tool that wrote the file. Empty: this module names itself.
     };
 
-    bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {});
+    bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {},
+                 const QString &underlaySvgPath = QString());
 
     /// @brief Write @p svgPath as ONE PDF, one page per rectangle in @p pages.
     ///
@@ -56,8 +57,8 @@ public:
     /// reference to those objects, offset so that its own rectangle of the plan lands on
     /// the sheet. The plan is therefore addressed N times rather than copied N times,
     /// which is what makes a tiled export cost the same whatever its page count, and what
-    /// leaves the page's own content stream free for the decor that belongs to a sheet
-    /// rather than to the plan.
+    /// leaves the page's own content stream free for whatever a sheet must carry of its
+    /// own.
     ///
     /// The layer set belongs to the DOCUMENT, since there is only one: one OCG object per
     /// layer, referenced by every page. A reader's panel shows one entry per layer, and
@@ -70,11 +71,17 @@ public:
     ///                 96 dpi, which is the resolution the graded writer assumes and the
     ///                 one kPixelToPt converts from.
     /// @param pdfPath  Output PDF file
+    /// @param underlaySvgPath  A second document, drawn on every page UNDER the layers and
+    ///                 outside every optional content group. Empty — the default — is a
+    ///                 document with no underlay. It must be laid out on the plan's own
+    ///                 page: same size, same viewBox, or it is refused rather than placed
+    ///                 on a guess.
     /// @return true on success
     bool convert(const QString     &svgPath,
                  const QVector<QRectF> &pages,
                  const QString     &pdfPath,
-                 const DocumentInfo &info = {});
+                 const DocumentInfo &info = {},
+                 const QString     &underlaySvgPath = QString());
 
 private:
     struct PageInfo
@@ -101,6 +108,25 @@ private:
         bool       plain = false; // the whole document: no layer, so no optional content
     };
 
+    /// @brief A second document, drawn on every page under every layer, and never optional.
+    ///
+    /// It is not a layer and never becomes one: no entry in the reader's panel switches it,
+    /// and no combination of layer states can hide it. That is the whole point of it. The
+    /// frame of a sheet, its registration marks and its numbering belong to the paper the
+    /// sheets are printed on, not to what is drawn on them — a sheet whose marks can be
+    /// switched off is a sheet that can be assembled wrongly.
+    ///
+    /// It is read from a document of its own, laid out in the plan's own coordinates, so
+    /// that each page shows of it exactly what falls inside that page: the same crop that
+    /// decides what the page shows of the plan decides what it shows of this.
+    struct Underlay
+    {
+        QByteArray stream;     // the shapes, as the renderer drew them
+        QByteArray textStream; // the text, re-emitted as path operators, its own CTM
+
+        bool isEmpty() const { return stream.isEmpty() && textStream.isEmpty(); }
+    };
+
     /// @brief One SVG, read back: its page, and the rendered content of each of its layers.
     ///
     /// Everything the writer needs, and nothing else: once this value exists the document
@@ -113,6 +139,7 @@ private:
         PageInfo              page;
         QVector<LayerContent> layers;
         bool                  plain{false}; ///< no layer group at all: a single-size document
+        Underlay              underlay;     ///< empty when the caller asked for none
     };
 
     QVector<LayerEntry> findLayers(const QDomDocument &doc) const;
@@ -128,6 +155,19 @@ private:
     QByteArray          buildLayerSvg(const QDomDocument &origDoc,
                                       const QDomElement   &layerEl,
                                       const PageInfo      &page) const;
+    /// @brief The underlay document, whole, laid out on the plan's own page.
+    ///
+    /// The same root as a layer's — the plan's size and viewBox — because the two land on
+    /// the paper together; but every top-level child comes along, not one group of them,
+    /// since an underlay has no layer groups to pick a group from.
+    QByteArray          buildUnderlaySvg(const QDomDocument &origDoc, const PageInfo &page) const;
+    /// @brief Read the underlay document into the streams a page will invoke it by.
+    ///
+    /// Refuses a document laid out to other figures than the plan's: it is drawn through
+    /// the plan's own translation, so a frame authored at another size would land off its
+    /// sheets, and a wrong frame is worse than a missing export.
+    bool                readUnderlay(const QString &svgPath, const PageInfo &plan,
+                                     Underlay &out);
     QByteArray          renderToPdfBuffer(const QByteArray &svgData,
                                           const PageInfo   &page) const;
     /// @brief The page's drawing, decompressed and ready to be wrapped in BDC/EMC.
@@ -145,7 +185,8 @@ private:
     /// The whole of what convert() used to do for a single document, lifted out so that a
     /// tiled conversion can call it once per sheet. The caller gets a value it can hold;
     /// nothing here depends on there being exactly one document.
-    SvgContent          readSvg(const QString &svgPath);
+    SvgContent          readSvg(const QString &svgPath,
+                                const QString &underlaySvgPath = QString());
 
     /// @brief Write @p doc as one PDF, one page per rectangle, over a single layer set.
     ///
