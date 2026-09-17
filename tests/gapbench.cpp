@@ -52,6 +52,9 @@
 //  harnais de non-régression — pour que la mesure porte sur les conditions
 //  réelles et non sur un cas de laboratoire. Duplication assumée : nestbench
 //  fige le jeu à 5 mm, cet instrument doit le faire varier.
+//
+//  Une exception, et une seule : l'obstacle A4, que nestbench pose dès que le bin
+//  tombe à 841 mm, n'est posé ici que sur un run NON tuilé. Voir §2.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -66,6 +69,11 @@ constexpr double kMmToPx = 96.0 / 25.4;
 constexpr double kScale = 1e6;
 
 constexpr double kPi = 3.14159265358979323846;
+
+/// La marge du document, en millimètres. Le JEU, lui, varie : c'est l'argument 3.
+/// Nommée parce que le plancher de surface la retire deux fois en largeur, et qu'un
+/// second `5.0` écrit ailleurs serait un second endroit à faire diverger.
+constexpr double kMarginMm = 5.0;
 
 using Clipper2Lib::Path64;
 using Clipper2Lib::Point64;
@@ -92,6 +100,14 @@ BBox Bounds(const Path64 &path)
     }
 
     return b;
+}
+
+/// La cellule (k, j) de la grille, en unités moteur, comme un contour fermé : le
+/// rectangle à quatre sommets, dans l'ordre. Sert à demander à Clipper2 si une
+/// pièce touche cette cellule — la question même que pose la règle d'impression.
+Path64 RectPath(int64_t x, int64_t y, int64_t w, int64_t h)
+{
+    return Path64{{x, y}, {x + w, y}, {x + w, y + h}, {x, y + h}};
 }
 
 /// Position absolue d'une pièce — réplique la transformation qu'écrit
@@ -310,13 +326,22 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // ── 2. Nesting, dans les conditions de nestbench ──────────────────────
+    // ── 2. Nesting ────────────────────────────────────────────────────────
+    //
+    // L'obstacle A4 de nestbench n'est posé QUE sur un run NON tuilé.
+    //
+    // La règle d'origine — « bin ≤ 841 mm » — décrit le roulé A0, dont c'est la
+    // largeur. Sur un tuilage elle est fausse deux fois : un bin étroit y est
+    // simplement un petit nombre de colonnes, et le mode Export ne pose jamais
+    // d'obstacle (Nesting.md:129 — « Aucun obstacle dans le bin »). Les deux
+    // conséquences sont mesurables : le recuit est perturbé, et la passe 2 refuse
+    // carrément de tourner (EngineRefine.cpp:210).
     const double binWidthPx = binWidthMm * kMmToPx;
-    const bool   isA0       = (binWidthMm <= 841.0);
+    const bool   isA0       = (binWidthMm <= 841.0) && (columns < 1);
     const double obsWPx     = isA0 ? 210.0 * kMmToPx : 0.0;
     const double obsHPx     = isA0 ? 297.0 * kMmToPx : 0.0;
 
-    Bin bin(binWidthPx, 5.0 * kMmToPx, obsWPx, obsHPx);
+    Bin bin(binWidthPx, kMarginMm * kMmToPx, obsWPx, obsHPx);
 
     Engine::Config cfg;
     cfg.gap = gapMm * kMmToPx;
@@ -335,6 +360,31 @@ int main(int argc, char *argv[])
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<Placement> placements = engine.place(bin, fp.polygons);
     const auto t1 = std::chrono::steady_clock::now();
+
+    // ── 2 bis. Un plan incomplet ne se mesure pas ─────────────────────────
+    //
+    // Une pièce qui n'a pas pu être placée porte `rotation < 0` : c'est le marqueur
+    // que le moteur pose sur un échec, et le seul que la passe 2 et Ostara lisent.
+    // Tout ce qui suit mesurerait une géométrie qui n'existe pas — le 17-09-2026,
+    // un bin trop étroit a rendu ici « remplissage 302 % » et « 4 colonnes sur 3 »,
+    // c'est-à-dire des chiffres tirés de pièces fantômes restées à l'origine. Un
+    // tel run ne se mesure pas, il se signale.
+    std::size_t unplaced = 0;
+    for (const Placement &p : placements)
+    {
+        if (p.rotation < 0.0)
+        {
+            ++unplaced;
+        }
+    }
+
+    if (unplaced > 0)
+    {
+        std::printf("NON PLACE               : %8zu piece(s) sur %zu"
+                    " — aucune mise en page n'existe, rien a mesurer\n",
+                    unplaced, placements.size());
+        return 2;
+    }
 
     // ── 3. Contours absolus ───────────────────────────────────────────────
     std::vector<Path64> contours;
@@ -458,6 +508,28 @@ int main(int argc, char *argv[])
         std::printf("paires en chevauchement : %6d   (doit valoir 0)\n", overlapping);
     }
 
+    // ── 4 bis. La surface, et ce qu'elle interdit ─────────────────────────
+    //
+    // Les pièces ne se chevauchent pas — le compteur ci-dessus vient de le dire —
+    // donc leur surface totale doit tenir dans la largeur utile fois la hauteur.
+    // C'est un PLANCHER, pas une estimation : aucun arrangement, aucune stratégie,
+    // aucun moteur ne peut descendre en dessous. Il sert à éliminer l'impossible,
+    // jamais à garantir le possible — un très bon nesting remplit 75 à 80 % de la
+    // place disponible, pas 100 %.
+    //
+    // La surface est celle des EMPREINTES telles qu'elles sont dessinées, jamais
+    // celle de leur boîte englobante : une empreinte est le contour de l'union de
+    // toutes les tailles d'une pièce, et son aire est celle de l'encre.
+    const double usedPx = Engine::UsedHeight(placements, fp.polygons, bin);
+    const double usedMm = usedPx / kMmToPx;
+
+    double areaUnits = 0.0;
+    for (const Path64 &p : fp.polygons)
+    {
+        areaUnits += std::abs(Clipper2Lib::Area(p));
+    }
+    const double areaMm2 = areaUnits * kToMm * kToMm;
+
     // ── 5. Dégagement au bord du bin ──────────────────────────────────────
     // Le bin est une bande : deux bords verticaux (x = 0 et x = largeur) et un
     // bord haut (y = 0). Pour une droite, la distance minimale d'un segment est
@@ -482,6 +554,29 @@ int main(int argc, char *argv[])
                     left * kToMm, right * kToMm, top * kToMm);
     }
 
+    // ── 5 bis. Le plancher de surface ─────────────────────────────────────
+    //
+    // La hauteur incompressible, et le taux de remplissage qui en découle. Le
+    // second est le chiffre utile : confronté au plafond réel d'un nesting de
+    // formes irrégulières — 75 à 80 % — il dit si le moteur laisse quelque chose
+    // sur la table, ou s'il est déjà au bout de ce que les formes permettent.
+    // Sans lui, on ne sait pas si un objectif peut encore gagner quoi que ce
+    // soit, et on réécrit l'objectif pour rien.
+    if (!contours.empty())
+    {
+        const double usableWidthMm = binWidthMm - 2.0 * kMarginMm;
+        const double inkHeightMm   = usedMm - kMarginMm;
+        const double floorMm       = usableWidthMm > 0.0 ? areaMm2 / usableWidthMm : 0.0;
+        const double fill          = (usableWidthMm > 0.0 && inkHeightMm > 0.0)
+                                         ? areaMm2 / (usableWidthMm * inkHeightMm) * 100.0
+                                         : 0.0;
+
+        std::printf("surface empreintes     : %10.1f mm2  (%8.1f cm2)\n", areaMm2, areaMm2 / 100.0);
+        std::printf("plancher de hauteur    : %10.3f mm   (surface / largeur utile %.1f mm)\n",
+                    floorMm, usableWidthMm);
+        std::printf("taux de remplissage    : %10.1f %%\n", fill);
+    }
+
     // ── 6. Les lignes de coupe ────────────────────────────────────────────
     //
     // La grille est construite comme Ostara la construit (OExportArtboards::
@@ -498,7 +593,6 @@ int main(int argc, char *argv[])
         const int64_t cellH       = static_cast<int64_t>(std::llround(frameHeightMm * kMmToEngine));
         const int64_t tolerance   = static_cast<int64_t>(std::llround(gapMm * kMmToEngine));
 
-        const double  usedPx     = Engine::UsedHeight(placements, fp.polygons, bin);
         const int64_t usedEngine = static_cast<int64_t>(std::llround(usedPx * kScale));
 
         int rows = 0;
@@ -555,14 +649,69 @@ int main(int argc, char *argv[])
             }
         }
 
+        // Combien de colonnes l'encre atteint réellement. C'est la question du
+        // tuilage : une colonne que rien ne touche n'est pas imprimée — la règle
+        // est qu'une feuille vide ne compte pas — donc le nombre de colonnes du bin
+        // n'est pas le nombre de colonnes imprimées.
+        double maxX = 0.0;
+        for (const Path64 &c : contours)
+        {
+            for (const Point64 &p : c)
+            {
+                maxX = std::max(maxX, static_cast<double>(p.x));
+            }
+        }
+        const int usedColumns = cellW > 0
+                                    ? static_cast<int>(maxX / static_cast<double>(cellW)) + 1
+                                    : columns;
+
+        // Le plancher de feuilles : la surface doit tenir dans les feuilles
+        // imprimées, donc feuilles >= surface / surface d'une feuille. De même
+        // nature que le plancher de hauteur — il élimine l'impossible.
+        const double cellAreaMm2 = (binWidthMm / columns) * frameHeightMm;
+        const int    floorSheets = cellAreaMm2 > 0.0
+                                       ? static_cast<int>(std::ceil(areaMm2 / cellAreaMm2))
+                                       : 0;
+
+        // Le compte EXACT des feuilles imprimées, et c'est celui-là qui décide.
+        //
+        // Une cellule qui ne contient rien n'est pas imprimée — la règle du mode
+        // Export — donc une rangée peut perdre une page et garder les autres. Le
+        // produit « colonnes atteintes x rangées » est le contour de la boîte, pas
+        // le nombre de pages : il majore, et comparer deux dispositions sur un
+        // majorant, c'est comparer deux choses qu'on n'a pas mesurées.
+        int printed = 0;
+        for (int j = 0; j < rows; ++j)
+        {
+            for (int k = 0; k < columns; ++k)
+            {
+                const Path64 cell = RectPath(cellW * k, cellH * j, cellW, cellH);
+
+                for (const Path64 &c : contours)
+                {
+                    if (!Clipper2Lib::Intersect({c}, {cell}, Clipper2Lib::FillRule::NonZero).empty())
+                    {
+                        ++printed;
+                        break;
+                    }
+                }
+            }
+        }
+
         const double envelopeMm = rows * frameHeightMm;
-        const double usedMm     = usedPx / kMmToPx;
 
         std::printf("grille                 : %d colonnes x %d rangees (cadre %.1f mm)\n",
                     columns, rows, frameHeightMm);
+        std::printf("colonnes atteintes     : %6d sur %d\n", usedColumns, columns);
         std::printf("hauteur                : utilisee %.3f mm   enveloppe %.3f mm"
                     "   bande morte %.3f mm\n",
                     usedMm, envelopeMm, envelopeMm - usedMm);
+        std::printf("feuilles au plus       : %6d   (colonnes atteintes x rangees)\n",
+                    usedColumns * rows);
+        std::printf("feuilles imprimees     : %6d   (cellules qui portent quelque chose)\n",
+                    printed);
+        std::printf("plancher de feuilles   : %6d   (surface / surface d'une feuille)\n",
+                    floorSheets);
         std::printf("lignes de coupe        : %d verticales + %d horizontales\n",
                     std::max(0, columns - 1), std::max(0, rows - 1));
         std::printf("BORDS longeant une ligne : %6d   (a moins de %.1f mm)\n",

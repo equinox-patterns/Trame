@@ -219,8 +219,14 @@ double Engine::placeSequential(const Bin &bin,
         int64_t ifpY0 = margin - bboxB.yMin;
 
         if (ifpX1 <= ifpX0) {
+            // A failure, and it has to LOOK like one. Writing the trial rotation here left
+            // the piece indistinguishable from a placed one — x and y keep their default
+            // (0, 0) — so a plan nothing could lay out came back as a plan, with a piece
+            // sitting in the corner on the other pieces. Neither guard could see it: the
+            // adjustment pass tests `rotation < 0`, and so does the host application. The
+            // sentinel the unplaced pieces already carry is the one marker both read.
             out[pieceIdx].pieceIndex = pieceIdx;
-            out[pieceIdx].rotation   = rIdx * m_config.rotationStep;
+            out[pieceIdx].rotation   = -1.0;
             return kBadHeight;
         }
 
@@ -298,8 +304,9 @@ double Engine::placeSequential(const Bin &bin,
 
         const Clipper2Lib::Point64 pos = findBottomLeft(feasible);
         if (pos.y >= infY) {
+            // The same failure, the same marker — see the note on the other one.
             out[pieceIdx].pieceIndex = pieceIdx;
-            out[pieceIdx].rotation   = rIdx * m_config.rotationStep;
+            out[pieceIdx].rotation   = -1.0;
             return kBadHeight;
         }
 
@@ -319,6 +326,20 @@ double Engine::placeSequential(const Bin &bin,
             maxYScaled = pieceTop;
     }
 
+    // The cost is the height used — and the reason it is NOT the number of sheets is worth writing
+    // down, because counting sheets is the obvious idea and it does not work.
+    //
+    // A tiled plan is paid for in sheets: the columns and the rows its ink reaches into. A cost
+    // that counted them was tried, here, on 17-09-2026, and changed nothing at all — the ink
+    // reached the right-hand edge of the bin in every run, before and after, for the plain reason
+    // that the placement below is bottom-left and bottom-left fills the width before it stacks.
+    // The search has no arrangement to offer in which the last column is empty, so no cost can
+    // prefer one; a cost that cannot be acted on only distorts the search. What narrows a tiled
+    // plan is the host's sheet rule — a sheet with nothing on it is not printed — and a hand on
+    // the canvas: measured, emptying one column of a five-column plan took it from ten sheets to
+    // eight.
+    //
+    // The height is what a ROLL is paid by, and a roll is what this engine has always nested.
     return maxYScaled / kScale;
 }
 
@@ -513,6 +534,20 @@ std::vector<Placement> Engine::place(const Bin &bin,
     }
 
     return best;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+auto Engine::SheetRows(double usedHeight, double artboardHeight) -> int
+{
+    if (artboardHeight <= 0.0) {
+        return 1;
+    }
+
+    // The tolerance, subtracted rather than added: a height that lands on the boundary counts as
+    // the row below it. See the note in the header — the two callers and the host application all
+    // mean the same thing by it, and the figure is the host's own.
+    const double rows = std::ceil(usedHeight / artboardHeight - 1e-9);
+    return static_cast<int>(std::max(rows, 1.0));
 }
 
 //---------------------------------------------------------------------------------------------------------------------

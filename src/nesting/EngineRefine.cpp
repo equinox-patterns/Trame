@@ -73,84 +73,6 @@ Point64 Delta(int64_t dx, int64_t dy)
     return Point64(dx, dy);
 }
 
-double PointToSegment(double px, double py, double ax, double ay, double bx, double by)
-{
-    const double dx   = bx - ax;
-    const double dy   = by - ay;
-    const double len2 = dx * dx + dy * dy;
-
-    double t = 0.0;
-    if (len2 > 0.0)
-    {
-        t = std::clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0.0, 1.0);
-    }
-
-    return std::hypot(px - (ax + t * dx), py - (ay + t * dy));
-}
-
-double Cross(double ox, double oy, double ax, double ay, double bx, double by)
-{
-    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-}
-
-/// Distance between two segments — zero when they cross.
-///
-/// Clipper2 has no contour-to-contour distance (nothing there takes two Paths),
-/// so this is written here. It is the same arithmetic as the measuring
-/// instrument in tests/gapbench.cpp, which is where it was checked against a
-/// clearance that was known in advance.
-double SegmentDistance(const Point64 &a1, const Point64 &a2,
-                       const Point64 &b1, const Point64 &b2)
-{
-    const double d1 = Cross(a1.x, a1.y, a2.x, a2.y, b1.x, b1.y);
-    const double d2 = Cross(a1.x, a1.y, a2.x, a2.y, b2.x, b2.y);
-    const double d3 = Cross(b1.x, b1.y, b2.x, b2.y, a1.x, a1.y);
-    const double d4 = Cross(b1.x, b1.y, b2.x, b2.y, a2.x, a2.y);
-
-    const bool cross = ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-                    && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
-
-    if (cross)
-    {
-        return 0.0;
-    }
-
-    return std::min({PointToSegment(a1.x, a1.y, b1.x, b1.y, b2.x, b2.y),
-                     PointToSegment(a2.x, a2.y, b1.x, b1.y, b2.x, b2.y),
-                     PointToSegment(b1.x, b1.y, a1.x, a1.y, a2.x, a2.y),
-                     PointToSegment(b2.x, b2.y, a1.x, a1.y, a2.x, a2.y)});
-}
-
-double PathDistance(const Path64 &a, const Path64 &b)
-{
-    double best = std::numeric_limits<double>::max();
-
-    const std::size_t na = a.size();
-    const std::size_t nb = b.size();
-
-    for (std::size_t i = 0; i < na; ++i)
-    {
-        const Point64 &a1 = a[i];
-        const Point64 &a2 = a[(i + 1) % na];
-
-        for (std::size_t j = 0; j < nb; ++j)
-        {
-            const double d = SegmentDistance(a1, a2, b[j], b[(j + 1) % nb]);
-            if (d < best)
-            {
-                best = d;
-
-                if (best <= 0.0)
-                {
-                    return 0.0;
-                }
-            }
-        }
-    }
-
-    return best;
-}
-
 /// How close a footprint border runs to a cut line — the number that matters.
 ///
 /// Crossing a line is NOT the defect: a piece larger than an artboard is cut,
@@ -223,11 +145,11 @@ void Engine::refine(const Bin &bin,
         return;
     }
 
-    // The envelope comes from the very number Ostara stores and turns into a
-    // page count — never from a local recomputation, which would drift.
-    const int64_t used     = static_cast<int64_t>(UsedHeight(best, pieces, bin) * kScale);
-    const int     rows     = std::max(1, static_cast<int>(std::ceil(
-                                 static_cast<double>(used) / static_cast<double>(cellH) - 1e-9)));
+    // The envelope comes from the very number the host application stores and
+    // turns into a page count — never from a local recomputation, which would
+    // drift. The rows are counted by the one function that counts them, which the
+    // annealing now aims at as well.
+    const int     rows     = SheetRows(UsedHeight(best, pieces, bin), m_config.artboardHeight);
     const int64_t envelope = static_cast<int64_t>(rows) * cellH;
 
     // One engine unit past the tolerance, so that "clear" stays clear once the
@@ -314,25 +236,6 @@ void Engine::refine(const Bin &bin,
         }
 
         return g;
-    };
-
-    // Smallest gap anywhere in the plan — what the second objective widens. It
-    // is the bottleneck, not the average: raising the tightest cut is what makes
-    // the sheet easier to work with, and a bottleneck cannot be bought by
-    // loosening one gap while squeezing another.
-    auto minClearance = [&](const std::vector<Point64> &p) -> double
-    {
-        double best = std::numeric_limits<double>::max();
-
-        for (std::size_t a = 0; a < n; ++a)
-        {
-            for (std::size_t b = a + 1; b < n; ++b)
-            {
-                best = std::min(best, PathDistance(contourAt(a, p[a]), contourAt(b, p[b])));
-            }
-        }
-
-        return best;
     };
 
     // ── A move is a BLOCK, not a piece ────────────────────────────────────
@@ -430,6 +333,12 @@ void Engine::refine(const Bin &bin,
 
     // ── Rounds ────────────────────────────────────────────────────────────
 
+    // The arrangement the first pass handed over, kept whole. The commits below
+    // write straight into `best`, so the promise this pass makes — never returning
+    // anything worse than what it was given — can only be kept by being able to
+    // hand this back. See the check at the end.
+    const std::vector<Placement> start = best;
+
     for (int round = 0; round < kMaxRounds; ++round)
     {
         bool moved = false;
@@ -443,8 +352,6 @@ void Engine::refine(const Bin &bin,
             const int quarter = std::max(1, static_cast<int>(std::lround(90.0 / m_config.rotationStep)));
 
             int                  bestG   = g0;
-            double               bestC   = 0.0;
-            bool                 haveC   = false;
             std::vector<Point64> bestPos = pos;
             int                  bestR   = savedR;
             bool                 found   = false;
@@ -479,7 +386,7 @@ void Engine::refine(const Bin &bin,
                 // vraiment une pièce qui dépasse d'un cheveu — les interdire
                 // était le défaut entier de la première version.
                 std::vector<Point64> deltas;
-                deltas.reserve(4 * (vLines.size() + hLines.size()) + 8);
+                deltas.reserve(4 * (vLines.size() + hLines.size()) + 2);
 
                 for (const int64_t line : vLines)
                 {
@@ -496,25 +403,16 @@ void Engine::refine(const Bin &bin,
                     deltas.push_back(Delta(0, (line - clear - g.yMin) - pos[i].y));
                 }
 
-                // ── Les déplacements qui desserrent vraiment ───────────────
+                // ── And two small nudges, for when the room is tight ───────
                 //
-                // Une pichenette de 5 mm ne sépare rien quand le voisin est à
-                // 5 mm : elle le pousse, et un bloc poussé garde ses écarts
-                // intacts. Pour élargir le point le plus étroit il faut aller
-                // franchement quelque part — aussi loin que l'enveloppe et le
-                // bin le permettent, dans chacune des quatre directions. C'est la
-                // pièce du bas qui gagne : elle descend dans la bande morte sans
-                // rien pousser.
-                //
-                // Les deux autres directions sont refusées par la borne basse de
-                // l'enveloppe dès qu'elles feraient perdre une rangée, et c'est
-                // exactement ce qu'on veut : elles ne coûtent qu'un essai.
-                deltas.push_back(Delta(0, (envelope - guard - margin - g.yMax) - pos[i].y));
-                deltas.push_back(Delta(0, (margin - g.yMin) - pos[i].y));
-                deltas.push_back(Delta((binW - margin - g.xMax) - pos[i].x, 0));
-                deltas.push_back(Delta((margin - g.xMin) - pos[i].x, 0));
-
-                // Et deux pichenettes, qui suffisent quand la place est juste.
+                // There used to be four more here — as far right, as far left, as
+                // high and as low as the bin and the envelope allowed. They served
+                // the second aim this pass no longer has: widening the tightest
+                // gap. A plan is paid for in rows of frames, and a block carried
+                // to the edge of the band fills cells that would otherwise be
+                // dropped, at a printed sheet each. Gone, and the small moves
+                // below are all that is left — they suffice when the room is
+                // tight, which is the only case this pass now has to answer.
                 deltas.push_back(Delta(0, gapR));
                 deltas.push_back(Delta(gapR, 0));
 
@@ -533,41 +431,14 @@ void Engine::refine(const Bin &bin,
 
                     const int g1 = grazingTotal(candidate);
 
-                    // Lexicographic, and that order is the whole point: a cut
-                    // line freed always wins. Pieces are never pushed into a
-                    // line to be pulled apart — the second objective waits.
+                    // A cut line freed is the ONLY reason to move anything. A
+                    // candidate that leaves the same borders grazing is passed
+                    // over, however far it would have carried the block: pulling
+                    // the pieces apart used to win this tie, and that is exactly
+                    // what filled the plan's empty cells and cost printed sheets.
                     if (g1 < bestG)
                     {
                         bestG   = g1;
-                        bestPos = candidate;
-                        bestR   = r;
-                        found   = true;
-                        haveC   = false; // le meilleur a bougé : dégagement à relire
-                        continue;
-                    }
-
-                    if (g1 > bestG)
-                    {
-                        continue;
-                    }
-
-                    // À égalité sur les lignes, c'est le desserrage qui tranche.
-                    if (!haveC)
-                    {
-                        // Le meilleur connu peut venir d'une AUTRE orientation :
-                        // son dégagement doit être relu dans celle-là, pas dans
-                        // celle qu'on est en train d'essayer.
-                        const int keep = rIdx[i];
-                        rIdx[i] = bestR;
-                        bestC = minClearance(bestPos);
-                        rIdx[i] = keep;
-                        haveC = true;
-                    }
-
-                    const double c1 = minClearance(candidate);
-                    if (c1 > bestC)
-                    {
-                        bestC   = c1;
                         bestPos = candidate;
                         bestR   = r;
                         found   = true;
@@ -596,6 +467,39 @@ void Engine::refine(const Bin &bin,
         if (!moved)
         {
             break;
+        }
+    }
+
+    // ── The promise, checked ──────────────────────────────────────────────
+    //
+    // "Transactional by construction: it works on a copy and commits only on an
+    // improvement, so it can never return something worse than the first pass."
+    // That was written and never verified — and on 17-09-2026 a plan came out of
+    // here with two pairs of pieces lying on one another. A plan whose pieces
+    // overlap is not a hard-to-print plan, it is not a plan: the drawing puts one
+    // piece on top of another and the paper shows one of them.
+    //
+    // So it is verified, once, on the arrangement about to be returned. Two
+    // contours that INTERSECT are two pieces in one place. The gap is deliberately
+    // not asked about: a pair sitting exactly at the gap is what a healthy plan
+    // looks like, and testing for it here would refuse perfectly good layouts.
+    //
+    // When the check fails the pass hands back what it was given, untouched — the
+    // promise, kept by construction rather than by hope. It says nothing about WHY
+    // it failed: the cause is still open, and a guard that concealed it would be
+    // worse than none.
+    for (std::size_t a = 0; a < n; ++a)
+    {
+        for (std::size_t b = a + 1; b < n; ++b)
+        {
+            const Paths64 hit = Clipper2Lib::Intersect({contourAt(a, pos[a])},
+                                                       {contourAt(b, pos[b])},
+                                                       Clipper2Lib::FillRule::NonZero);
+            if (!hit.empty())
+            {
+                best = start;
+                return;
+            }
         }
     }
 }

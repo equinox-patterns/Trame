@@ -91,6 +91,24 @@ public:
                              const std::vector<Clipper2Lib::Path64> &pieces,
                              const Bin &bin);
 
+    /// How many printed sheet rows a used height costs, on a frame @p artboardHeight tall.
+    ///
+    /// The number the host application turns a used height into, written once so that the two
+    /// places needing it cannot answer differently: the adjustment pass, which may not cross a row
+    /// boundary either way, and the host's own reading of the same formula. Both measure from the
+    /// used height WITH the bin margin already in it — which is what UsedHeight returns — and both
+    /// lengths are in the unit of the input polygons. artboardHeight is in that same unit, as
+    /// Config says.
+    ///
+    /// Note what this is NOT: it is not the cost the annealing minimises. That is the height, and
+    /// it has to be — see the note in placeSequential. This counts the rows the host will print,
+    /// which is a different question asked of the same height.
+    ///
+    /// The tolerance is not decoration. A height landing exactly on a multiple of the frame sits
+    /// one rounding away from counting a whole extra sheet, and a printed sheet nobody asked for
+    /// is worse than a hair of unused paper. Same figure as the host application's own tolerance.
+    static auto SheetRows(double usedHeight, double artboardHeight) -> int;
+
 private:
     // ── Precomputed per-(piece, rotation) geometry ───────────────────────
 
@@ -116,7 +134,11 @@ private:
     // ── Placement ────────────────────────────────────────────────────────
 
     /// Sequential bottom-left placement for a given order and rotation indices.
-    /// Returns the total height used in mm, or a very large value on failure.
+    ///
+    /// Returns the height used, or a very large value when a piece cannot be placed at all. The
+    /// height is what a ROLL is paid by, and a roll is what this engine nests. Counting the
+    /// printed SHEETS instead was tried on 17-09-2026 and could not be acted on from here — the
+    /// note in the .cpp says why, and is worth reading before trying it again.
     double placeSequential(const Bin &bin,
                            const std::vector<std::vector<RotGeom>> &rotBank,
                            NFPCache &nfpCache,
@@ -143,18 +165,26 @@ private:
 
     /// Second pass over an already decided placement, inside a frozen envelope.
     ///
-    /// Two aims, in this order: keep every footprint border off the artboard cut
-    /// lines, then spend whatever room is left to pull the pieces apart. It runs
-    /// AFTER the annealing — never inside it — so the search above stays exactly
-    /// what it was before tiling existed, and Rabnest, which has no printing
-    /// formats, keeps nesting as it always did.
+    /// ONE aim: keep every footprint border off the artboard cut lines. A border
+    /// running along a line is a cut that nicks the piece, so the pass moves a
+    /// block until its borders sit a full gap clear of every interior line.
+    ///
+    /// **It used to carry a second aim — spending whatever room was left pulling
+    /// the pieces apart — and that aim is gone (17-09-2026).** Widening the
+    /// tightest gap is the opposite of what a tiled plan wants: a plan is paid for
+    /// in rows of frames, and pieces spread to the edges of the band fill cells
+    /// that would otherwise be dropped, at a printed sheet each. Measured on a
+    /// seven-piece pattern, A3 in three columns: the aim took the used height from
+    /// 927 mm to 1260 mm on a 1260 mm envelope, and the tightest gap from 5 mm to
+    /// 47 mm. The hand that wants room has the canvas to make it in; the machine's
+    /// job is to hand it the least paper to work on.
+    ///
+    /// It runs AFTER the annealing — never inside it — so the search above stays
+    /// the search it is, and Rabnest, which has no printing formats, keeps nesting
+    /// as it always did.
     ///
     /// Transactional by construction: it works on a copy and commits only on an
     /// improvement, so it can never return something worse than the first pass.
-    /// It measures true clearances with its own segment-to-segment arithmetic
-    /// rather than reusing the NFP cache: the cache answers "would these
-    /// overlap at the gap", and a piece that must be nudged needs to know by
-    /// how much, which the NFP does not say.
     void refine(const Bin &bin,
                 const std::vector<std::vector<RotGeom>> &rotBank,
                 std::vector<Placement> &best,
