@@ -238,7 +238,8 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
 // ── Public API ────────────────────────────────────────────────────────────
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
-                          const DocumentInfo &info, const QString &underlaySvgPath)
+                          const DocumentInfo &info, const QString &underlaySvgPath,
+                          bool mepIsLayer)
 {
     // One page, and the document is that page: the rectangle covers everything the SVG
     // draws. This is what the svg2ocgpdf tool asks for, and it is the shape a single-size
@@ -250,12 +251,12 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
     const QRectF whole(0.0, 0.0, doc.page.sizeMm.width() * kPixelsPerMm,
                        doc.page.sizeMm.height() * kPixelsPerMm);
 
-    return buildOcgPdf(pdfPath, doc, QVector<QRectF>{whole}, info);
+    return buildOcgPdf(pdfPath, doc, QVector<QRectF>{whole}, info, mepIsLayer);
 }
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
                           const QString &pdfPath, const DocumentInfo &info,
-                          const QString &underlaySvgPath)
+                          const QString &underlaySvgPath, bool mepIsLayer)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: no page to write";
@@ -281,8 +282,16 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         return false;
     }
 
-    return buildOcgPdf(pdfPath, doc, pages, info);
+    return buildOcgPdf(pdfPath, doc, pages, info, mepIsLayer);
 }
+
+namespace
+{
+/// Declared here and defined with the other readers of the rendered document, further down.
+/// readSvg comes first in this file and is one of the two callers: the alpha states have to be
+/// lifted out of the buffer while it is still alive, and that is inside readSvg, not after it.
+void CollectAlphaStates(const QByteArray &pdfBuf, const QByteArray &stream, AlphaStates &into);
+}  // namespace
 
 SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
                                               const QString &underlaySvgPath)
@@ -312,7 +321,7 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
     // out of here — the layered document and the flat one alike. It is on every sheet or on
     // none: a frame that made it onto half the paper would be worse than no export at all.
     if (!underlaySvgPath.isEmpty()
-        && !readUnderlay(underlaySvgPath, result.page, result.underlay)) {
+        && !readUnderlay(underlaySvgPath, result.page, result.underlay, result.alphaStates)) {
         return result; // ok stays false
     }
 
@@ -337,6 +346,11 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
             qWarning() << "SvgToOcgPdf: failed to extract the content stream";
             return result;
         }
+
+        // The states the drawing reaches for, taken while the rendered document is still here:
+        // the buffer does not outlive this function, and buildOcgPdf — the only place the
+        // output file exists — will need the bodies long after it is gone.
+        CollectAlphaStates(pdfBuf, stream, result.alphaStates);
 
         LayerContent whole;
         whole.name = QStringLiteral("Document");
@@ -370,12 +384,14 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
             continue;
         }
 
+        CollectAlphaStates(pdfBuf, stream, result.alphaStates);
+
         QByteArray textStream;
         // For MEP layer, generate text as PDF path operators
         // (kept separate — must not be affected by QSvgRenderer's CTM)
         if (layer.isMep) {
             const double pageHeightPt = result.page.sizeMm.height() * kPointsPerMm;
-            textStream = emitMepTextAsPdfOps(layer.element, pageHeightPt);
+            textStream = emitMepTextAsPdfOps(layer.element, pageHeightPt, result.alphaStates);
         }
 
         result.layers.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
@@ -563,7 +579,7 @@ QByteArray SvgToOcgPdf::buildUnderlaySvg(const QDomDocument &origDoc, const Page
 }
 
 bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
-                               Underlay &out)
+                               Underlay &out, AlphaStates &alpha)
 {
     QFile file(svgPath);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -607,8 +623,10 @@ bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
     // Its text goes the way the layout layer's text goes, and for the same reason: the
     // renderer cannot draw it into a form that carries no font, so it is re-emitted here as
     // path operators, in a scope of its own.
+    CollectAlphaStates(pdfBuf, out.stream, alpha);
+
     out.textStream = emitMepTextAsPdfOps(doc.documentElement(),
-                                         plan.sizeMm.height() * kPointsPerMm);
+                                         plan.sizeMm.height() * kPointsPerMm, alpha);
     return true;
 }
 
@@ -702,6 +720,162 @@ auto DeclaredStreamLength(const QByteArray &pdfBuf, const QByteArray &objectHead
     }
 
     return digits ? resolved : -1;
+}
+
+/// @brief The alpha states a rendered stream reaches for, in the order it first reaches for them.
+///
+/// The names are read out of the stream itself. Qt writes `/GState11 gs`, and 11 is the number of
+/// the object that held that state in ITS file — so the stream already carries everything needed
+/// to find it again, and the source's /Resources dictionary never has to be parsed.
+///
+/// Read from the stream rather than from the resources on purpose: a state the drawing never
+/// invokes is one there is no reason to carry across, and the stream is the only authority on
+/// what it will actually call.
+auto ReferencedAlphaStates(const QByteArray &stream) -> QVector<int>
+{
+    const QByteArray marker = "/GState";
+    QVector<int> numbers;
+
+    int at = 0;
+    while (true) {
+        const int found = stream.indexOf(marker, at);
+        if (found < 0)
+            break;
+        at = found + static_cast<int>(marker.size());
+
+        int cursor = at;
+        int number = 0;
+        bool digits = false;
+        while (cursor < stream.size() && stream[cursor] >= '0' && stream[cursor] <= '9') {
+            number = number * 10 + (stream[cursor] - '0');
+            ++cursor;
+            digits = true;
+        }
+
+        // What has to follow is "gs", the operator that invokes the state. `/GState11` spelled
+        // without it is how an entry is NAMED in a /Resources dictionary — a declaration, not an
+        // invocation — and there is none of those in a content stream anyway.
+        while (cursor < stream.size() && stream[cursor] == ' ')
+            ++cursor;
+        const bool invoked = digits && cursor + 1 < stream.size()
+                             && stream[cursor] == 'g' && stream[cursor + 1] == 's';
+
+        if (invoked && !numbers.contains(number))
+            numbers.append(number);
+    }
+
+    return numbers;
+}
+
+/// @brief The body of object @p num as @p pdfBuf wrote it, or empty when it is not there.
+///
+/// This is the piece the module never had: everything else here reads STREAMS, and a graphics
+/// state is a plain dictionary, so there was no way to lift one out of the rendered document.
+///
+/// The search is bounded the way the rest of this file has learned to bound it. `N 0 obj` occurs
+/// inside compressed data often enough that a bare `indexOf` has already put a slice in the
+/// middle of a stream once, and the decor layer paid for it — see the warning in
+/// extractContentStream. Two things keep it honest here: the header must not be the tail of a
+/// longer number, and a dictionary must follow it. A byte inside an image spells neither.
+auto ExtractObjectBody(const QByteArray &pdfBuf, int num) -> QByteArray
+{
+    const QByteArray header = QByteArray::number(num) + " 0 obj";
+    int from = 0;
+
+    while (true) {
+        const int at = pdfBuf.indexOf(header, from);
+        if (at < 0)
+            return {};
+        from = at + 1;
+
+        // Not the tail of a longer number: "11 0 obj" is spelled inside "111 0 obj".
+        if (at > 0 && pdfBuf[at - 1] != '\n' && pdfBuf[at - 1] != '\r' && pdfBuf[at - 1] != ' ')
+            continue;
+
+        int cursor = at + static_cast<int>(header.size());
+        while (cursor < pdfBuf.size()
+               && (pdfBuf[cursor] == ' ' || pdfBuf[cursor] == '\n' || pdfBuf[cursor] == '\r'
+                   || pdfBuf[cursor] == '\t')) {
+            ++cursor;
+        }
+
+        if (cursor + 1 >= pdfBuf.size() || pdfBuf[cursor] != '<' || pdfBuf[cursor + 1] != '<')
+            continue;
+
+        const int end = pdfBuf.indexOf("endobj", cursor);
+        if (end < 0)
+            return {};
+
+        return pdfBuf.mid(cursor, end - cursor);
+    }
+}
+
+/// @brief The state that carries @p opacity, added to @p alpha the first time it is asked for.
+///
+/// The re-emitted text has no object behind it in the rendered document — nothing upstream ever
+/// gave it a state, since it is drawn here from a `QPainterPath` — so its state has to be made.
+/// The name is therefore ours, and it is the alpha itself in thousandths: `GSt400` is 40 %.
+///
+/// By value rather than by rank, so that the name does not depend on how many texts came before
+/// it or in what order. Two numbers at the same opacity share one state, and reading the same
+/// document twice writes the same file.
+///
+/// A thousandth is the resolution, and it is far finer than any of this is looked at: the field
+/// the user sets is a whole percent, and `fill-opacity` arrives from it.
+auto AlphaNameFor(AlphaStates &alpha, double opacity) -> QString
+{
+    const int perMille = qBound(1, qRound(opacity * 1000.0), 999);
+    const QString name = QStringLiteral("GSt%1").arg(perMille);
+
+    for (const AlphaState &state : alpha) {
+        if (state.name == name)
+            return name;
+    }
+
+    // Shaped like the one Qt writes for itself, so that a reader meets one kind of state in this
+    // file rather than two.
+    alpha.append({name, QStringLiteral("<< /Type /ExtGState /SA true /SM 0.02"
+                                       " /ca %1 /CA %1 /AIS false /SMask /None >>\n")
+                            .arg(perMille / 1000.0, 0, 'f', 3).toUtf8()});
+    return name;
+}
+
+/// @brief Adds every alpha state @p stream reaches for, copied out of the document it came from.
+///
+/// Silent about a state it has already taken: two layers invoking the same state share one
+/// object, exactly as they shared one in the file Qt wrote.
+void CollectAlphaStates(const QByteArray &pdfBuf, const QByteArray &stream, AlphaStates &into)
+{
+    for (int num : ReferencedAlphaStates(stream)) {
+        const QString name = QStringLiteral("GState%1").arg(num);
+
+        bool known = false;
+        for (const AlphaState &state : into) {
+            if (state.name == name) {
+                known = true;
+                break;
+            }
+        }
+        if (known)
+            continue;
+
+        QByteArray body = ExtractObjectBody(pdfBuf, num);
+        if (body.isEmpty()) {
+            // Worth saying out loud: the drawing will print solid there, and nothing else in
+            // the file will admit it.
+            qWarning() << "SvgToOcgPdf: the alpha state" << name
+                       << "is invoked but was not found in the rendered document";
+            continue;
+        }
+
+        // Qt writes these objects as `<< /ca … /CA … >>`, with no /Type — and the specification
+        // requires one on a graphics state dictionary. Copied as it stands, the entry would be a
+        // dictionary that never says what it is: taken by a forgiving reader, refused by a strict
+        // one. Put in just after the opening braces, where a dictionary's first entry belongs.
+        body.insert(2, " /Type /ExtGState");
+
+        into.append({name, body});
+    }
 }
 }  // namespace
 
@@ -858,7 +1032,8 @@ QByteArray SvgToOcgPdf::decompressFlate(const QByteArray &compressed)
 }
 
 QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
-                                               double           pageHeightPt) const
+                                               double           pageHeightPt,
+                                               AlphaStates     &alpha) const
 {
     QByteArray buf;
 
@@ -970,6 +1145,22 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
                            .arg(a, 0, 'f', 6).arg(b_coord, 0, 'f', 6)
                            .arg(cc, 0, 'f', 6).arg(d, 0, 'f', 6)
                            .arg(xPt, 0, 'f', 6).arg(yPt, 0, 'f', 6).toUtf8());
+
+            // The strength this text is filled at, when it is less than full. `fill-opacity` is
+            // where the SVG carries it — a pen colour with an alpha becomes that attribute and
+            // nothing else — and a PDF has no alpha in its colour operators, so it can only be a
+            // graphics state. Inside the q/Q of this text, so that it does not outlive it.
+            //
+            // Absent means full strength, which is the common case and writes nothing at all:
+            // a page of opaque numbers must come out exactly as it did before there were states.
+            const double fillOpacity =
+                el.attribute(QStringLiteral("fill-opacity"), QStringLiteral("1")).toDouble();
+            if (fillOpacity < 1.0)
+            {
+                buf.append(QStringLiteral("/%1 gs\n")
+                               .arg(AlphaNameFor(alpha, fillOpacity)).toUtf8());
+            }
+
             buf.append(QStringLiteral("%1 %2 %3 rg\n")
                            .arg(fr, 0, 'f', 4).arg(fg, 0, 'f', 4).arg(fb, 0, 'f', 4)
                            .toUtf8());
@@ -1131,7 +1322,8 @@ auto ReadPlacement(const QByteArray &stream, Placement &out) -> bool
 bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                                const SvgContent      &doc,
                                const QVector<QRectF> &pages,
-                               const DocumentInfo    &info)
+                               const DocumentInfo    &info,
+                               bool                   mepIsLayer)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: nothing to write";
@@ -1208,9 +1400,17 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         }
     }
 
-    // Decor OCG (always ON)
+    // Whether the decor is one of the reader's layers at all. Its content is drawn either way —
+    // what this decides is whether the reader is offered a way to take it off the page, and with
+    // it the underlay, which belongs to the paper the decor is printed on.
+    //
+    // One name short throughout: allocate no object, name it in no /Properties, list it in
+    // neither /OCGs nor /Order, and mark its invocation with nothing.
+    const bool mepOcg = withOcg && mepIsLayer && mepLayer != nullptr;
+
+    // Decor OCG (always ON when it is one)
     int mepOcgObj = 0;
-    if (withOcg && mepLayer != nullptr) {
+    if (mepOcg) {
         mepOcgObj = pdf.alloc();
         pdf.add(mepOcgObj,
                 "<< /Type /OCG /Name " + pdfTextString(mepLayer->displayName) + " >>\n");
@@ -1222,11 +1422,31 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
             QStringLiteral("<< /Type /ExtGState /SA true /SM 0.02 /ca 1.0 /CA 1.0"
                            " /AIS false /SMask /None >>\n").toUtf8());
 
+    // The states the content actually reaches for, allocated here and nowhere else. This is the
+    // first point at which the output file exists — which is the whole reason the streams carried
+    // their names up out of readSvg.
+    //
+    // Qt expressed an alpha as a graphics state and had the stream call it by name. Extracting
+    // only the stream left the state behind in the rendered document, so every one of those names
+    // resolved to nothing: a reader ignores the instruction, the drawing keeps the strength it
+    // had, and a frame that prints solid looks like a frame.
+    //
+    // /GSa is kept whatever happens. It is the state each stream OPENS with, so a file whose only
+    // entry was a partial one would leave the rest of the drawing at whatever it inherited.
+    QByteArray extGStates;
+    extGStates.append(QStringLiteral("/GSa %1 0 R").arg(gsaObj).toUtf8());
+    for (const AlphaState &state : doc.alphaStates) {
+        // Allocated and added in one step, as everywhere in this function: the xref is written
+        // positionally, so a number taken and never written shifts every offset after it.
+        const int stateObj = addObject(state.body);
+        extGStates.append(QStringLiteral(" /%1 %2 0 R").arg(state.name).arg(stateObj).toUtf8());
+    }
+
     // The Properties dictionary binds each layer NAME — what the content streams address —
     // to its OCG object. It is the same on every page, because the OCG objects are the
     // document's; only the streams differ, and the names are what point into them.
     QByteArray propsDict;
-    if (withOcg && mepLayer != nullptr) {
+    if (mepOcg) {
         propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
                              .arg(mepLayer->name)
                              .arg(mepOcgObj).toUtf8());
@@ -1340,12 +1560,13 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                 "<< /Type /XObject /Subtype /Form\n"
                 "   /BBox [%1]\n"
                 "   /Resources <<\n"
-                "      /ExtGState << /GSa %2 0 R >>\n"
+                "      /ExtGState << %2 >>\n"
                 "      /ColorSpace << /CSp /DeviceRGB >>\n"
                 "   >>\n"
                 "   /Length %3 >>\n"
                 "stream\n"
-            ).arg(QString::fromUtf8(bbox)).arg(gsaObj).arg(content.size()).toUtf8()
+            ).arg(QString::fromUtf8(bbox)).arg(QString::fromUtf8(extGStates))
+             .arg(content.size()).toUtf8()
             + content
             + "\nendstream");
     };
@@ -1419,14 +1640,23 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                               .arg(dy, 0, 'f', 6)
                               .toUtf8());
 
-        // The underlay first, and in no /OC block: it is not a layer, so nothing in the
-        // reader's panel reaches it, and it lies under the drawing rather than over it.
-        // Invoked here, after the page's translation, it is in the plan's own frame — so
-        // each page shows of it exactly what falls inside the page, the same crop that
-        // decides what the page shows of the plan.
+        // The underlay first, and under the drawing rather than over it. It carries the decor's
+        // marker when the decor is a layer of its own — the frame, the numbering and the marks
+        // are drawn on the paper, so they belong to the page's own layer. With no decor layer
+        // there is nothing to mark it with and it stands alone, which is the safe way round: a
+        // mark that can be switched off is a sheet that can be assembled wrongly.
+        //
+        // ⚠️ Marked, never MOVED. It stays first in this stream and therefore stays under
+        // everything. A PDF layer is a marker around a range rather than a container, so the
+        // marker can travel to it here — but putting its `Do` inside the decor's own block
+        // would lift the frame and the numbering over the pieces.
         if (underlayFormIndex >= 0) {
+            if (mepOcg)
+                streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mepLayer->name).toUtf8());
             streamData.append(
                 QStringLiteral("q\n/Fm%1 Do\nQ\n").arg(underlayFormIndex).toUtf8());
+            if (mepOcg)
+                streamData.append("EMC\n");
         }
 
         for (int i = 0; i < drawing.size(); ++i) {
@@ -1434,10 +1664,15 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
             // The layer markers stay HERE, in the page's own stream, resolving through the
             // /Properties of the page — which is where they have always been. Only the
             // drawing moved into the form, and this is what keeps the layer logic still.
-            if (withOcg)
+            //
+            // A decor that is not a layer is named by nothing: marking it would point at a
+            // name the page's /Properties no longer carries, and the reader would take the
+            // whole decoration for a layer it can switch off.
+            const bool marked = withOcg && (!layer->isMep || mepIsLayer);
+            if (marked)
                 streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(layer->name).toUtf8());
             streamData.append(QStringLiteral("q\n/Fm%1 Do\nQ\n").arg(i).toUtf8());
-            if (withOcg)
+            if (marked)
                 streamData.append("EMC\n");
         }
         streamData.append("Q\n");
@@ -1460,7 +1695,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                 "   /MediaBox [0 0 %2 %3]\n"
                 "   /Contents %4 0 R\n"
                 "   /Resources <<\n"
-                "      /ExtGState << /GSa %5 0 R >>\n"
+                "      /ExtGState << %5 >>\n"
                 "      /ColorSpace << /CSp /DeviceRGB >>\n"
                 "      /XObject <<\n"
                 "%6"
@@ -1474,7 +1709,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
              .arg(pageWidthPt, 0, 'f', 6)
              .arg(pageHeightPt, 0, 'f', 6)
              .arg(contentObj)
-             .arg(gsaObj)
+             .arg(QString::fromUtf8(extGStates))
              .arg(QString::fromUtf8(xobjects))
              .arg(QString::fromUtf8(propsDict))
              .toUtf8());
@@ -1496,7 +1731,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
     QByteArray ocgRefs;
     QByteArray orderRefs;
 
-    if (mepLayer) {
+    if (mepOcg) {
         const QByteArray ref = QByteArray::number(mepOcgObj) + " 0 R ";
         ocgRefs.append(ref);
         orderRefs.append(ref);
@@ -1558,11 +1793,12 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                     .arg(-placement.d * pages.first().height(), 0, 'f', 2);
     qDebug() << "  Forms:" << formObjs.size() << "— the plan is written and rendered once";
     if (underlayFormIndex >= 0) {
-        qDebug() << "  Underlay: on every page, under every layer, in no layer group";
+        qDebug() << "  Underlay: on every page, under every layer,"
+                 << (mepOcg ? "marked with the decor layer" : "in no layer group");
     }
     if (withOcg) {
         qDebug() << "  OCG layers:" << sizeLayers.size()
-                   << "+ decor:" << (mepLayer != nullptr ? 1 : 0);
+                   << "+ decor:" << (mepOcg ? 1 : 0);
     } else {
         qDebug() << "  Flat document: no optional content";
     }

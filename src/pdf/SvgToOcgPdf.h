@@ -22,6 +22,31 @@
 #include <QString>
 #include <QVector>
 
+/// @brief An alpha state a content stream reaches by name, and that the Forms must declare.
+///
+/// A PDF carries no alpha in its colour operators. Opacity travels in a graphics state, and a
+/// stream reaches one by NAME — `/GState11 gs` — never by value. A name that resolves to nothing
+/// is not something a reader reports: the instruction is ignored, and the drawing comes out at
+/// full strength. That silence is why this went unnoticed — a frame that prints solid looks like
+/// a frame.
+///
+/// Two hands fill this list, and they never collide.
+///
+/// Qt names the states it allocated after the object they were in ITS file — `/GState11` is
+/// object 11 of the PDF Qt rendered — so those are copied across under the very name the stream
+/// already calls. Only the object number in our own file changes.
+///
+/// The re-emitted text has no such object behind it: it is drawn here, from a `QPainterPath`, so
+/// nothing upstream ever gave it a state. Its states are therefore named by rank — `GSt1`, then
+/// `GSt2` — which is ours to choose precisely because no stream came in expecting a name.
+struct AlphaState
+{
+    QString    name; ///< without the leading slash: `GState11`, `GSt1`
+    QByteArray body; ///< the object's own dictionary, ready to be written as it stands
+};
+
+using AlphaStates = QVector<AlphaState>;
+
 class SvgToOcgPdf
 {
 public:
@@ -48,7 +73,7 @@ public:
     };
 
     bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {},
-                 const QString &underlaySvgPath = QString());
+                 const QString &underlaySvgPath = QString(), bool mepIsLayer = true);
 
     /// @brief Write @p svgPath as ONE PDF, one page per rectangle in @p pages.
     ///
@@ -76,12 +101,33 @@ public:
     ///                 document with no underlay. It must be laid out on the plan's own
     ///                 page: same size, same viewBox, or it is refused rather than placed
     ///                 on a guess.
+    /// @param mepIsLayer  Whether the decor layer is offered as one of the reader's layers.
+    ///                 True — the default — is the historical behaviour: it appears in the
+    ///                 panel beside the sizes and can be switched off.
+    ///
+    ///                 False takes the whole of it out of the optional content: no OCG object
+    ///                 is allocated, it is named in no /Properties, it appears in neither
+    ///                 /OCGs nor /Order, and its invocation in the page stream carries no /OC
+    ///                 marker. It is DRAWN exactly the same — the Form is written and invoked
+    ///                 as always, in the same place in the same order — and what disappears is
+    ///                 only the reader's ability to take it off the page.
+    ///
+    ///                 That is the point of the switch. A plan whose decor can be switched off
+    ///                 is a plan that can be printed without its cartouche, its folds or its
+    ///                 annotations and look perfectly normal — the silent kind of wrong. The
+    ///                 caller decides; this module only does as it is told.
+    ///
+    ///                 ⚠️ It also governs the underlay, and that is deliberate: an underlay is
+    ///                 drawn on the paper, so it belongs to the decor layer when there is one.
+    ///                 With this false the underlay is unconditional, as it has always been —
+    ///                 which is why the safe setting is the one that has no layer at all.
     /// @return true on success
     bool convert(const QString     &svgPath,
                  const QVector<QRectF> &pages,
                  const QString     &pdfPath,
                  const DocumentInfo &info = {},
-                 const QString     &underlaySvgPath = QString());
+                 const QString     &underlaySvgPath = QString(),
+                 bool               mepIsLayer = true);
 
 private:
     struct PageInfo
@@ -140,6 +186,12 @@ private:
         QVector<LayerContent> layers;
         bool                  plain{false}; ///< no layer group at all: a single-size document
         Underlay              underlay;     ///< empty when the caller asked for none
+
+        /// Every alpha state the content above calls by name, whichever layer or document it
+        /// came from. Document-wide rather than per layer, because a Form's /Resources is the
+        /// only place a name resolves and every Form is written from this one list — sharing it
+        /// also means two layers asking for the same state get one object between them.
+        AlphaStates           alphaStates;
     };
 
     QVector<LayerEntry> findLayers(const QDomDocument &doc) const;
@@ -167,7 +219,7 @@ private:
     /// the plan's own translation, so a frame authored at another size would land off its
     /// sheets, and a wrong frame is worse than a missing export.
     bool                readUnderlay(const QString &svgPath, const PageInfo &plan,
-                                     Underlay &out);
+                                     Underlay &out, AlphaStates &alpha);
     QByteArray          renderToPdfBuffer(const QByteArray &svgData,
                                           const PageInfo   &page) const;
     /// @brief The page's drawing, decompressed and ready to be wrapped in BDC/EMC.
@@ -178,8 +230,14 @@ private:
     /// splitting the two let a truncated part reach the caller as if it were whole.
     QByteArray          extractContentStream(const QByteArray &pdfBuf);
     QByteArray          decompressFlate(const QByteArray &compressed);
+    /// @brief The text of @p root, as path operators, in a scope of its own.
+    ///
+    /// Stayed `const` while gaining @p alpha: it touches no member, and the states it turns out
+    /// to need are not its to allocate — the file is not being built yet at the time it runs.
+    /// It appends what it used and names it, and buildOcgPdf allocates the lot later.
     QByteArray          emitMepTextAsPdfOps(const QDomElement &root,
-                                              double           pageHeightPt) const;
+                                              double           pageHeightPt,
+                                              AlphaStates     &alpha) const;
     /// @brief Read one SVG into its page and the rendered content of each of its layers.
     ///
     /// The whole of what convert() used to do for a single document, lifted out so that a
@@ -198,7 +256,8 @@ private:
     bool                buildOcgPdf(const QString         &pdfPath,
                                     const SvgContent      &doc,
                                     const QVector<QRectF> &pages,
-                                    const DocumentInfo    &info);
+                                    const DocumentInfo    &info,
+                                    bool                   mepIsLayer);
 };
 
 #endif // SVGTOOCGPDF_H

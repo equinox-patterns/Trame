@@ -42,8 +42,21 @@ int main(int argc, char *argv[])
         args.removeAt(underlayAt);
     }
 
+    // Whether the layout stays one of the reader's layers. Default yes, which is what this
+    // tool has always produced; --no-layout-layer writes it into the file with no marker at
+    // all. Named rather than positional, like --underlay, so an existing command line keeps
+    // its meaning — and here for the same reason: without it that path is exercisable only
+    // through Ostara.
+    bool layoutLayer = true;
+    const int noLayoutAt = args.indexOf(QStringLiteral("--no-layout-layer"));
+    if (noLayoutAt >= 0) {
+        layoutLayer = false;
+        args.removeAt(noLayoutAt);
+    }
+
     if (args.isEmpty()) {
-        qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]";
+        qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]"
+                      " [--no-layout-layer]";
         return 1;
     }
 
@@ -59,7 +72,7 @@ int main(int argc, char *argv[])
     }
 
     SvgToOcgPdf converter;
-    if (!converter.convert(svgPath, pdfPath, {}, underlayPath)) {
+    if (!converter.convert(svgPath, pdfPath, {}, underlayPath, layoutLayer)) {
         qWarning() << "Conversion failed";
         return 1;
     }
