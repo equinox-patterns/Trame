@@ -107,7 +107,7 @@ double BorderToLine(const Path64 &c, int64_t coord, bool vertical)
 } // namespace
 
 //---------------------------------------------------------------------------------------------------------------------
-void Engine::refine(const Bin &bin,
+bool Engine::refine(const Bin &bin,
                     const std::vector<std::vector<RotGeom>> &rotBank,
                     std::vector<Placement> &best,
                     const std::vector<Clipper2Lib::Path64> &pieces) const
@@ -120,13 +120,13 @@ void Engine::refine(const Bin &bin,
     // plan that does not exist.
     if (n < 2 || pieces.size() != n)
     {
-        return;
+        return false;
     }
     for (const Placement &p : best)
     {
         if (p.rotation < 0.0)
         {
-            return;
+            return false;
         }
     }
 
@@ -138,7 +138,7 @@ void Engine::refine(const Bin &bin,
 
     if (cellW <= 0 || cellH <= 0)
     {
-        return;
+        return false;
     }
 
     // What the first pass kept clear, this pass must keep clear too — every
@@ -181,7 +181,7 @@ void Engine::refine(const Bin &bin,
 
     if (vLines.empty() && hLines.empty())
     {
-        return;
+        return false;
     }
 
     std::vector<int>     rIdx(n, 0);
@@ -189,10 +189,13 @@ void Engine::refine(const Bin &bin,
 
     for (std::size_t i = 0; i < n; ++i)
     {
+        if (IsAbandoned())
+            return true;
+
         const int r = static_cast<int>(std::llround(best[i].rotation / m_config.rotationStep));
         if (r < 0 || static_cast<std::size_t>(r) >= rotBank[i].size())
         {
-            return;
+            return false;
         }
 
         rIdx[i] = r;
@@ -372,6 +375,11 @@ void Engine::refine(const Bin &bin,
 
     for (int round = 0; round < kMaxRounds; ++round)
     {
+        // The pass is a second search of its own, over the same pieces. Asked once a round, which
+        // is where its time goes.
+        if (IsAbandoned())
+            return true;
+
         bool moved = false;
 
         for (std::size_t i = 0; i < n; ++i)
@@ -521,6 +529,9 @@ void Engine::refine(const Bin &bin,
     // worse than none.
     for (std::size_t a = 0; a < n; ++a)
     {
+        if (IsAbandoned())
+            return true;
+
         for (std::size_t b = a + 1; b < n; ++b)
         {
             const Paths64 hit = Clipper2Lib::Intersect({contourAt(a, pos[a])},
@@ -529,7 +540,7 @@ void Engine::refine(const Bin &bin,
             if (!hit.empty())
             {
                 best = start;
-                return;
+                return false;
             }
         }
     }
@@ -545,8 +556,10 @@ void Engine::refine(const Bin &bin,
                                         Clipper2Lib::FillRule::NonZero).empty())
             {
                 best = start;
-                return;
+                return false;
             }
         }
     }
+
+    return true;
 }

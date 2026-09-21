@@ -16,6 +16,7 @@
 #define ENGINE_H
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -55,6 +56,17 @@ public:
         /// repeat the lie.
         int    artboardCount  = 0;     ///< Frames side by side across the bin width
         double artboardHeight = 0.0;   ///< Frame height
+
+        /// Asked between annealing iterations and between adjustment passes: true means the
+        /// caller wants the run given up, and it is given up there and then.
+        ///
+        /// **Null means never**, which is what a caller with nobody in front of it wants: a batch
+        /// run has no one to ask and nothing to give up for. It is the caller with a window — and
+        /// someone watching it — that hands one over.
+        ///
+        /// ⚠️ **Called on the worker thread.** Whatever it reads must be readable from there, and
+        /// it must be cheap: it runs once per annealing iteration, of which a run has hundreds.
+        std::function<bool()> abandoned;
     };
 
     // ── NFP cache ──────────────────────────────────────────────────────────
@@ -72,8 +84,15 @@ public:
     explicit Engine(const Config &cfg) noexcept;
 
     /// Place all pieces in the bin. Returns a placement for each input piece.
+    ///
+    /// **A given-up run returns what it had when it was stopped**, which may be fewer placements
+    /// than there are pieces, or none at all. @p abandoned says which happened — a caller that
+    /// passed no callback can never see true. A run that was abandoned has no answer to give: its
+    /// result is a half-built plan, and reading it as a finished one would place pieces that were
+    /// never placed.
     std::vector<Placement> place(const Bin &bin,
-                                 const std::vector<Clipper2Lib::Path64> &pieces) const;
+                                 const std::vector<Clipper2Lib::Path64> &pieces,
+                                 bool *abandoned = nullptr) const;
 
     /// Envelope height of a placement result, in the unit of the input polygons
     /// (the bin margin included).
@@ -175,13 +194,20 @@ private:
 
     // ── Optimisation ─────────────────────────────────────────────────────
 
-    void anneal(const Bin &bin,
+    /// @return true when the run was given up before the search ran its course.
+    bool anneal(const Bin &bin,
                 const std::vector<std::vector<RotGeom>> &rotBank,
                 NFPCache &nfpCache,
                 NFPCache &obstacleCache,
                 const std::vector<ZoneGeom> &zones,
                 std::vector<Placement> &best,
                 int64_t infY) const;
+
+    /// Whether the caller has asked for the run to be given up. False when it handed over none.
+    bool IsAbandoned() const
+    {
+        return m_config.abandoned && m_config.abandoned();
+    }
 
     // ── Adjustment pass ──────────────────────────────────────────────────
     //
@@ -211,7 +237,8 @@ private:
     ///
     /// Transactional by construction: it works on a copy and commits only on an
     /// improvement, so it can never return something worse than the first pass.
-    void refine(const Bin &bin,
+    /// @return true when the run was given up before the pass ran its course.
+    bool refine(const Bin &bin,
                 const std::vector<std::vector<RotGeom>> &rotBank,
                 std::vector<Placement> &best,
                 const std::vector<Clipper2Lib::Path64> &pieces) const;

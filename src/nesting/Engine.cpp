@@ -317,7 +317,7 @@ double Engine::placeSequential(const Bin &bin,
 
 // ── Simulated annealing ──────────────────────────────────────────────────────
 
-void Engine::anneal(const Bin &bin,
+bool Engine::anneal(const Bin &bin,
                     const std::vector<std::vector<RotGeom>> &rotBank,
                     NFPCache &nfpCache,
                     NFPCache &obstacleCache,
@@ -327,7 +327,7 @@ void Engine::anneal(const Bin &bin,
 {
     const int N = static_cast<int>(rotBank.size());
     if (N == 0)
-        return;
+        return false;
 
     std::mt19937 rng(42);
 
@@ -359,6 +359,12 @@ void Engine::anneal(const Bin &bin,
     int plateauCount = 0;
 
     for (int iter = 0; iter < m_config.maxIterations && T > 0.01; ++iter) {
+        // **Asked once an iteration, which is where a run spends its time.** The annealing walks
+        // the pieces hundreds of times; a request to give up that waited for the whole search
+        // would be a request answered after the person asking had stopped waiting.
+        if (IsAbandoned())
+            return true;
+
         std::vector<int> newOrder = order;
         std::vector<int> newRot   = rotIdx;
 
@@ -401,6 +407,8 @@ void Engine::anneal(const Bin &bin,
 
         T *= m_config.coolingRate;
     }
+
+    return false;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -411,8 +419,12 @@ Engine::Engine(const Config &cfg) noexcept
 }
 
 std::vector<Placement> Engine::place(const Bin &bin,
-                                     const std::vector<Clipper2Lib::Path64> &pieces) const
+                                     const std::vector<Clipper2Lib::Path64> &pieces,
+                                     bool *abandoned) const
 {
+    if (abandoned != nullptr)
+        *abandoned = false;
+
     const int N = static_cast<int>(pieces.size());
     if (N == 0)
         return {};
@@ -461,14 +473,32 @@ std::vector<Placement> Engine::place(const Bin &bin,
     constexpr int64_t kMaxSafe = int64_t(1) << 50;
     const int64_t infY = totalH > 0 ? totalH : kMaxSafe;
 
+    // Asked before the search starts as well: a run given up while its pieces were being read has
+    // no reason to search for a plan nobody is waiting for any more.
+    if (IsAbandoned()) {
+        if (abandoned != nullptr)
+            *abandoned = true;
+        return {};
+    }
+
     std::vector<Placement> best;
-    anneal(bin, rotBank, nfpCache, obstacleCache, zones, best, infY);
+    if (anneal(bin, rotBank, nfpCache, obstacleCache, zones, best, infY)) {
+        // **What came back is a half-built plan, and is handed back as one.** The caller is told
+        // the run was given up; a caller that reads the placements without asking has taken a
+        // decision that was never made. See the note on place() in the header.
+        if (abandoned != nullptr)
+            *abandoned = true;
+        return best;
+    }
 
     // The adjustment pass — strictly after the search, never inside it. The
     // grid is read here and nowhere else: the annealing above runs exactly as
     // it did before tiling existed, and without a grid this line does nothing.
     if (m_config.artboardCount > 0 && m_config.artboardHeight > 0.0) {
-        refine(bin, rotBank, best, pieces);
+        if (refine(bin, rotBank, best, pieces)) {
+            if (abandoned != nullptr)
+                *abandoned = true;
+        }
     }
 
     return best;

@@ -144,8 +144,12 @@ TiledEngine::TiledEngine(const Spec &spec) noexcept
 
 //---------------------------------------------------------------------------------------------------------------------
 std::vector<Placement> TiledEngine::place(const Bin &bin,
-                                          const std::vector<Clipper2Lib::Path64> &pieces) const
+                                          const std::vector<Clipper2Lib::Path64> &pieces,
+                                          bool *abandoned) const
 {
+    if (abandoned != nullptr)
+        *abandoned = false;
+
     const int N = static_cast<int>(pieces.size());
     if (N == 0)
         return {};
@@ -222,6 +226,15 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
 
     for (const int pieceIdx : order)
     {
+        // **Asked once a piece**, which is where this engine spends its time: each one is tried
+        // against every row the plan has opened. See Engine::Config::abandoned.
+        if (IsAbandoned())
+        {
+            if (abandoned != nullptr)
+                *abandoned = true;
+            return out;
+        }
+
         const BBox &b0 = rotBank[pieceIdx][0].bbox;
 
         // Une pièce plus large que le bin ne se placera jamais, quel que soit

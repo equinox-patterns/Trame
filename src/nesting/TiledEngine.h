@@ -67,6 +67,11 @@ public:
         /// hole needs. The full 2° bank the annealing uses would multiply the
         /// work by forty-five for orientations a garment piece never uses.
         bool allowRotation = true;
+
+        /// Asked between the pieces the greedy pass places: true means the caller wants the run
+        /// given up. **Null means never**, as in Engine::Config — see there for what it is for and
+        /// what it costs to answer.
+        std::function<bool()> abandoned;
     };
 
     /// The surfaces that decide the target — Sophie's own figures.
@@ -100,10 +105,19 @@ public:
     /// ⚠️ `Bin::zones()` is NOT read. A tiled run carries no obstacle — the
     /// engine that poses them is the strip one — and the forbidden-page loop
     /// that would use them is parked.
+    /// @p abandoned is set to true when the run was given up — see Engine::place, whose contract
+    /// this one shares: what comes back from an abandoned run is a half-built plan.
     std::vector<Placement> place(const Bin &bin,
-                                 const std::vector<Clipper2Lib::Path64> &pieces) const;
+                                 const std::vector<Clipper2Lib::Path64> &pieces,
+                                 bool *abandoned = nullptr) const;
 
 private:
+    /// Whether the caller has asked for the run to be given up. False when it handed over none.
+    bool IsAbandoned() const
+    {
+        return m_spec.abandoned && m_spec.abandoned();
+    }
+
     Spec m_spec;
 };
 
