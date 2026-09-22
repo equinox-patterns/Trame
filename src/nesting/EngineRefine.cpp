@@ -561,5 +561,11 @@ bool Engine::refine(const Bin &bin,
         }
     }
 
-    return true;
+    // The pass ran its course and committed. `false`, because this return value says ONE thing
+    // and it is not "did it work": Engine::place reads it as "the run was given up" and throws
+    // the whole plan away without a word. A `true` here declared every SUCCESSFUL adjustment an
+    // abandonment — which is every tiled plan the pass improved, and only those: a rolled-back
+    // pass (the two returns above) kept its plan. Measured on the framed formats, whose geometry
+    // is the one the pass succeeds on: 95 seconds of annealing, then nothing on screen.
+    return false;
 }
