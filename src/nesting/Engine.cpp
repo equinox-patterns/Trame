@@ -48,71 +48,20 @@ using NestGeom::negatePath;
 using NestGeom::findBottomLeft;
 using NestGeom::nfpOutsideIFP;
 using NestGeom::ensureCCW;
+// Named, and not re-exported by Engine.h: a using-declaration at class scope may only
+// name a base class's member, so the factory is reached through the kernel that owns it.
+using NestGeom::makeNFPCacheKey;
 
 // ── Forbidden zones ──────────────────────────────────────────────────────────
-
-std::vector<Engine::ZoneGeom> Engine::buildZoneGeom(const Bin &bin, int64_t gapScaled)
-{
-    std::vector<ZoneGeom> out;
-    out.reserve(bin.zones().size());
-
-    for (const Bin::Zone &z : bin.zones())
-    {
-        if (z.width <= 0.0 || z.height <= 0.0)
-            continue;
-
-        const int64_t x0 = static_cast<int64_t>(z.x * kScale);
-        const int64_t y0 = static_cast<int64_t>(z.y * kScale);
-        const Clipper2Lib::Path64 raw =
-            makeRect(x0, y0,
-                     x0 + static_cast<int64_t>(z.width  * kScale),
-                     y0 + static_cast<int64_t>(z.height * kScale));
-
-        // Normalize, exactly as the A0 obstacle always was. The NFP is then
-        // cached on this local geometry and merely translated to the origin
-        // below, so moving a zone costs nothing and two zones can never be
-        // confused for one another.
-        const BBox rawBB = bboxFromPath(raw);
-
-        ZoneGeom g;
-        g.local     = translatePath(raw, -rawBB.xMin, -rawBB.yMin);
-        g.bboxLocal = bboxFromPath(g.local);   // BEFORE inflation — see the header
-        g.originX   = rawBB.xMin;
-        g.originY   = rawBB.yMin;
-
-        // Inflated by the FULL gap, exactly like the placed pieces — see the
-        // note on gapRadius. Halving it here would leave a piece only gap/2
-        // clear of a forbidden page, the same defect in a second place.
-        if (gapScaled > 0)
-        {
-            auto inflated = Clipper2Lib::InflatePaths({g.local}, gapScaled,
-                Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
-            if (!inflated.empty())
-                g.local = inflated[0];
-        }
-
-        out.push_back(std::move(g));
-    }
-
-    return out;
-}
-
-Clipper2Lib::Paths64 Engine::absoluteZonePaths(const std::vector<ZoneGeom> &zones)
-{
-    Clipper2Lib::Paths64 subjects;
-    subjects.reserve(zones.size());
-
-    for (const ZoneGeom &z : zones)
-        subjects.push_back(translatePath(z.local, z.originX, z.originY));
-
-    if (subjects.empty())
-        return {};
-
-    // One region rather than a list the caller has to reason about: two zones
-    // that overlap are one hole, and the fill rule should not be the thing that
-    // says so.
-    return Clipper2Lib::Union(subjects, Clipper2Lib::FillRule::NonZero);
-}
+//
+// The geometry moved to `nesting/ZoneGeom.h` when the Tiled engine had to honour
+// the zones too: `NestZone::Build` and `NestZone::Absolute` are what used to stand
+// here, and `NestZone::Subtract` is the loop that used to sit in placeSequential.
+// Both engines call them now, so neither can answer "keep this rectangle free" its
+// own way.
+//
+// Nothing is left behind as a forwarder on purpose: a `Engine::buildZoneGeom` that
+// called `NestZone::Build` would have been a second name for one function.
 
 // ── Sequential placement ─────────────────────────────────────────────────────
 
@@ -148,7 +97,7 @@ double Engine::placeSequential(const Bin &bin,
     // piece whose NFP is subtracted from the IFP of every new piece. The
     // geometry arrives already built: this function runs once per annealing
     // iteration, so building it here would pay for K inflations hundreds of
-    // times over (see buildZoneGeom).
+    // times over (see NestZone::Build).
 
     // The deepest zone floors the reported height: the A0 sheet sits at the
     // corner, and a plan cannot be shorter than the sheet it was given.
@@ -229,46 +178,12 @@ double Engine::placeSequential(const Bin &bin,
                 }
             }
 
-            // Subtract every forbidden zone's NFP (each like a pre-placed piece
-            // at its own place). Clipper64 unions its clips, which is exactly
-            // what "the piece must avoid all of them" means — the same property
-            // the placed pieces above already rely on.
-            //
-            // A zone's NFP only depends on the current (piece, rotation) AND on
-            // the zone, so the cache key carries the zone index. That is the
-            // first trap of this change stated as code: a key that reserved a
-            // single slot for "the obstacle" let two zones overwrite each
-            // other's NFP, and the second one to be asked won.
-            for (std::size_t zi = 0; zi < zones.size(); ++zi)
-            {
-                const ZoneGeom &z = zones[zi];
-
-                const int64_t zoneNfpMaxX = z.originX + z.bboxLocal.xMax - bboxB.xMin;
-                const int64_t zoneNfpMinX = z.originX + z.bboxLocal.xMin - bboxB.xMax;
-                const int64_t zoneNfpMaxY = z.originY + z.bboxLocal.yMax - bboxB.yMin;
-                if (zoneNfpMaxY <= ifpY0 || zoneNfpMaxX <= ifpX0 || zoneNfpMinX >= ifpX1)
-                    continue;
-
-                const NFPCacheKey zkey = makeNFPCacheKey(pieceIdx, rIdx,
-                                                         kZoneKeyTag,
-                                                         static_cast<int>(zi));
-                const Clipper2Lib::Paths64 *nfpZonePtr = nullptr;
-                auto zit = obstacleCache.find(zkey);
-                if (zit != obstacleCache.end()) {
-                    nfpZonePtr = &zit->second;
-                } else {
-                    Clipper2Lib::Paths64 nfpZone =
-                        Clipper2Lib::MinkowskiSum(z.local, bg.neg, true);
-                    for (auto &np : nfpZone) {
-                        if (Clipper2Lib::Area(np) < 0)
-                            std::reverse(np.begin(), np.end());
-                    }
-                    auto [ins, _] = obstacleCache.emplace(zkey, std::move(nfpZone));
-                    nfpZonePtr = &ins->second;
-                }
-
-                clipper.AddClip(translatePaths(*nfpZonePtr, z.originX, z.originY));
-            }
+            // Subtract every forbidden zone's NFP — one call, because the Tiled
+            // engine asks the same question and one rule may not have two answers.
+            // What stands behind it is in `nesting/ZoneGeom.h`, with the note that
+            // says why the cache key carries the zone index.
+            NestZone::Subtract(clipper, zones, bg, pieceIdx, rIdx, ifpX0, ifpX1, ifpY0,
+                               obstacleCache);
 
             clipper.Execute(Clipper2Lib::ClipType::Difference,
                            Clipper2Lib::FillRule::NonZero, feasible);
@@ -455,7 +370,7 @@ std::vector<Placement> Engine::place(const Bin &bin,
     // run: the annealing below calls placeSequential hundreds of times, and
     // rebuilding K inflations on each of those calls is what this avoids.
     const std::vector<ZoneGeom> zones =
-        buildZoneGeom(bin, static_cast<int64_t>(m_config.gap * kScale));
+        NestZone::Build(bin.zones(), static_cast<int64_t>(m_config.gap * kScale));
 
     NFPCache nfpCache;
     nfpCache.reserve(std::size_t(N) * numRots * 4);

@@ -55,6 +55,7 @@ set(TRAME_HEADERS
     src/nesting/Footprint.h
     src/nesting/NestGeom.h
     src/nesting/TiledEngine.h
+    src/nesting/ZoneGeom.h
     src/pdf/PdfBuilder.h
     src/pdf/SvgToOcgPdf.h
 )

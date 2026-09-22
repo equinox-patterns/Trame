@@ -102,9 +102,20 @@ public:
     /// `rotation` in degrees, and `rotation < 0` marks a piece that could not
     /// be placed at all.
     ///
-    /// ⚠️ `Bin::zones()` is NOT read. A tiled run carries no obstacle — the
-    /// engine that poses them is the strip one — and the forbidden-page loop
-    /// that would use them is parked.
+    /// `Bin::zones()` IS read, like the strip engine reads it: a piece may not be
+    /// placed where the run must not print — the block a cover page stands in, and
+    /// any page a tiled plan has to keep clear. Both engines subtract them through
+    /// the same implementation (`nesting/ZoneGeom.h`), so the two cannot come to
+    /// disagree about what keeping a rectangle free means.
+    ///
+    /// A zone the bin does not have changes NOTHING here: with an empty list the
+    /// subtraction loop never runs and the placements are the ones this engine has
+    /// always made.
+    ///
+    /// ⚠️ A zone that leaves no room in any row stops the search rather than opening
+    /// rows for ever — the piece is marked unplaced (`rotation < 0`), exactly like a
+    /// piece wider than the bin, and the caller keeps whatever the strip engine
+    /// produced.
     /// @p abandoned is set to true when the run was given up — see Engine::place, whose contract
     /// this one shares: what comes back from an abandoned run is a half-built plan.
     std::vector<Placement> place(const Bin &bin,

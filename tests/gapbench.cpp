@@ -290,12 +290,19 @@ double BBoxGap(const BBox &a, const BBox &b)
     return std::hypot(dx, dy);
 }
 
-/// « ligne:colonne,ligne:colonne » — 1-based, comme on lit un plan.
+/// « ligne:colonne » ou « mm:x:y:largeur:hauteur », séparés par des virgules.
 ///
-/// Chaque couple devient UNE cellule de la grille, construite comme Ostara
-/// construit la sienne (OExportArtboards::Compute) : la largeur du bin divisée
-/// par le nombre de colonnes, la hauteur du cadre telle quelle. Une « page
-/// interdite » est une case de la grille, et rien d'autre.
+/// La PREMIÈRE forme — 1-based, comme on lit un plan — devient UNE cellule de la
+/// grille, construite comme Ostara construit la sienne (`OExportArtboards::Compute`) :
+/// la largeur du bin divisée par le nombre de colonnes, la hauteur du cadre telle
+/// quelle. Une « page interdite » est une case de la grille, et rien d'autre.
+///
+/// La SECONDE est un rectangle libre, en millimètres depuis le coin du bin, et elle
+/// existe parce que la première ne sait nommer qu'une CASE ENTIÈRE : le bloc de page
+/// de garde — 210 x 297 dans une feuille de 297 x 420 — n'est ni une cellule ni un
+/// ratio, donc le cas réel n'était pas mesurable. Ses quatre champs sont séparés par
+/// « : » comme les deux de la première forme, et NON par des virgules : la virgule
+/// sépare déjà les éléments de la liste.
 ///
 /// Rend false quand la spécification est illisible : un instrument qui mesure
 /// autre chose que ce qu'on lui a demandé ne mesure rien.
@@ -308,29 +315,57 @@ bool ParseZones(const QString &spec, double binWidthPx, int columns,
         return true;
     }
 
-    if (columns < 1 || frameHeightMm <= 0.0)
+    const QStringList elements = spec.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &element : elements)
     {
-        std::fprintf(stderr,
-                     "Les pages interdites exigent <colonnes> et <hauteur_cadre_mm>.\n");
-        return false;
-    }
+        const QStringList fields = element.split(QLatin1Char(':'), Qt::SkipEmptyParts);
 
-    const double cellWpx = binWidthPx / columns;
-    const double cellHpx = frameHeightMm * kMmToPx;
-
-    const QStringList cells = spec.split(QLatin1Char(','), Qt::SkipEmptyParts);
-    for (const QString &cell : cells)
-    {
-        const QStringList rc = cell.split(QLatin1Char(':'), Qt::SkipEmptyParts);
-        if (rc.size() != 2)
+        // ── Le rectangle libre, en millimètres ────────────────────────────
+        if (fields.size() == 5
+            && fields[0].compare(QLatin1String("mm"), Qt::CaseInsensitive) == 0)
         {
-            std::fprintf(stderr, "Page interdite illisible : « %s » (attendu ligne:colonne).\n",
-                         qPrintable(cell));
+            bool okX = false;
+            bool okY = false;
+            bool okW = false;
+            bool okH = false;
+            const double x = fields[1].toDouble(&okX);
+            const double y = fields[2].toDouble(&okY);
+            const double w = fields[3].toDouble(&okW);
+            const double h = fields[4].toDouble(&okH);
+
+            if (!okX || !okY || !okW || !okH || w <= 0.0 || h <= 0.0)
+            {
+                std::fprintf(stderr,
+                             "Zone illisible : « %s » (attendu mm:x:y:largeur:hauteur,"
+                             " en millimètres, largeur et hauteur positives).\n",
+                             qPrintable(element));
+                return false;
+            }
+
+            out.push_back({x * kMmToPx, y * kMmToPx, w * kMmToPx, h * kMmToPx});
+            continue;
+        }
+
+        // ── La case de la grille ──────────────────────────────────────────
+        if (columns < 1 || frameHeightMm <= 0.0)
+        {
+            std::fprintf(stderr,
+                         "Les pages interdites en cases exigent <colonnes> et"
+                         " <hauteur_cadre_mm>.\n");
             return false;
         }
 
-        const int row = rc[0].toInt();
-        const int col = rc[1].toInt();
+        if (fields.size() != 2)
+        {
+            std::fprintf(stderr,
+                         "Page interdite illisible : « %s » (attendu ligne:colonne,"
+                         " ou mm:x:y:largeur:hauteur).\n",
+                         qPrintable(element));
+            return false;
+        }
+
+        const int row = fields[0].toInt();
+        const int col = fields[1].toInt();
         if (row < 1 || col < 1 || col > columns)
         {
             std::fprintf(stderr, "Page interdite hors grille : %d:%d (%d colonnes).\n",
@@ -338,10 +373,24 @@ bool ParseZones(const QString &spec, double binWidthPx, int columns,
             return false;
         }
 
+        const double cellWpx = binWidthPx / columns;
+        const double cellHpx = frameHeightMm * kMmToPx;
         out.push_back({(col - 1) * cellWpx, (row - 1) * cellHpx, cellWpx, cellHpx});
     }
 
     return true;
+}
+
+/// Une zone du Bin, dans les unités du moteur — c'est-à-dire en pixels multipliés
+/// par `kScale`, comme les contours qu'on lui confronte.
+auto ZonePath(const Bin::Zone &zone) -> Path64
+{
+    const int64_t x0 = static_cast<int64_t>(std::llround(zone.x * kScale));
+    const int64_t y0 = static_cast<int64_t>(std::llround(zone.y * kScale));
+    const int64_t x1 = static_cast<int64_t>(std::llround((zone.x + zone.width) * kScale));
+    const int64_t y1 = static_cast<int64_t>(std::llround((zone.y + zone.height) * kScale));
+
+    return {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
 }
 
 } // namespace
@@ -362,6 +411,10 @@ int main(int argc, char *argv[])
                      "        pages_interdites = « ligne:colonne,ligne:colonne » (1-based) :\n"
                      "        chaque case nommee est une page sur laquelle RIEN ne doit\n"
                      "        s'imprimer. Le moteur doit la contourner, ou echouer.\n"
+                     "        Un element peut aussi etre « mm:x:y:largeur:hauteur », en\n"
+                     "        millimetres depuis le coin du bin : un rectangle libre, la\n"
+                     "        ou la forme en cases ne sait nommer qu'une case entiere.\n"
+                     "        Exemple : « mm:0:0:210:297 » est le bloc d'une page de garde.\n"
                      "        moteur = bande (defaut, minimise une hauteur) ou tiled\n"
                      "        (paie en pages : grosses pieces d'abord, puis les petites\n"
                      "        dans les trous au vrai contour).\n");
@@ -434,7 +487,9 @@ int main(int argc, char *argv[])
 
     if (!zones.empty())
     {
-        std::printf("pages interdites : %s  (%zu cases)\n",
+        // « zones » et non « pages » : un élément peut être un rectangle libre, qui n'est
+        // la case d'aucune grille. Le mot doit dire ce que l'instrument a reçu.
+        std::printf("zones interdites : %s  (%zu)\n",
                     qPrintable(zoneSpec), zones.size());
         for (std::size_t i = 0; i < zones.size(); ++i)
         {
@@ -676,6 +731,39 @@ int main(int argc, char *argv[])
         std::printf("paires en chevauchement : %6d   (doit valoir 0)\n", overlapping);
     }
 
+    // ── 4c. Les zones interdites ──────────────────────────────────────────
+    //
+    // Le compteur du dessus confronte les pièces ENTRE ELLES. Celui-ci les confronte
+    // à ce sur quoi rien ne doit s'imprimer — la page de garde, le jour venu.
+    //
+    // Sans lui l'instrument imprime les zones et les placements côte à côte et
+    // n'affirme RIEN sur leur relation : il était incapable d'échouer sur le défaut
+    // même qu'il existe pour attraper, et un moteur qui ignore `Bin::zones()` — ce que
+    // fait TiledEngine aujourd'hui — passait pour un moteur qui les respecte.
+    //
+    // Les zones sont lues SUR LE BIN, jamais sur la liste d'arguments : c'est ce que
+    // le moteur a réellement reçu, et une zone perdue en route se voit ici.
+    if (!bin.zones().empty() && !contours.empty())
+    {
+        Clipper2Lib::Paths64 forbidden;
+        forbidden.reserve(bin.zones().size());
+        for (const Bin::Zone &z : bin.zones())
+        {
+            forbidden.push_back(ZonePath(z));
+        }
+
+        int inside = 0;
+        for (const Path64 &c : contours)
+        {
+            if (!Clipper2Lib::Intersect({c}, forbidden, Clipper2Lib::FillRule::NonZero).empty())
+            {
+                ++inside;
+            }
+        }
+
+        std::printf("contours dans une zone : %6d   (doit valoir 0)\n", inside);
+    }
+
     // ── 4 bis. La surface, et ce qu'elle interdit ─────────────────────────
     //
     // Les pièces ne se chevauchent pas — le compteur ci-dessus vient de le dire —
@@ -849,6 +937,7 @@ int main(int argc, char *argv[])
         // le nombre de pages : il majore, et comparer deux dispositions sur un
         // majorant, c'est comparer deux choses qu'on n'a pas mesurées.
         int printed = 0;
+        QVector<bool> usedCells(rows * columns, false);
         for (int j = 0; j < rows; ++j)
         {
             for (int k = 0; k < columns; ++k)
@@ -860,6 +949,7 @@ int main(int argc, char *argv[])
                     if (!Clipper2Lib::Intersect({c}, {cell}, Clipper2Lib::FillRule::NonZero).empty())
                     {
                         ++printed;
+                        usedCells[j * columns + k] = true;
                         break;
                     }
                 }
@@ -878,6 +968,70 @@ int main(int argc, char *argv[])
                     usedColumns * rows);
         std::printf("feuilles imprimees     : %6d   (cellules qui portent quelque chose)\n",
                     printed);
+
+        // OÙ est le trou, en ligne:colonne — parce qu'un compte ne dit pas où il est, et que deux
+        // plans au même compte peuvent avoir leur case vide à deux endroits qui ne se valent pas :
+        // une case vide au COIN est la place d'une page de garde, une case vide au fond est du
+        // papier perdu. C'est ce que le mode Export a besoin de distinguer.
+        {
+            QStringList emptyCells;
+            for (int j = 0; j < rows; ++j)
+            {
+                for (int k = 0; k < columns; ++k)
+                {
+                    if (!usedCells[j * columns + k])
+                    {
+                        emptyCells.append(
+                            QStringLiteral("%1:%2").arg(j + 1).arg(k + 1));
+                    }
+                }
+            }
+
+            if (!emptyCells.isEmpty())
+            {
+                std::printf("cellules vides         : %s\n",
+                            qPrintable(emptyCells.join(QLatin1Char(' '))));
+            }
+        }
+
+        // ── Combien de pièces par case imprimée ──────────────────────────
+        //
+        // C'est la TAILLE DU CHANTIER, et rien d'autre : une passe qui doit vider une case du
+        // fond déplace les pièces de cette case, et c'est ce compte-là qui dit si l'on parle de
+        // trois déplacements ou de quarante. Le temps d'une passe se déduit de ce chiffre avant
+        // qu'une ligne de passe soit écrite.
+        //
+        // ⚠️ Une pièce à cheval sur une frontière est comptée dans les DEUX cases : c'est
+        // exactement ce qui rend une case imprimée, et c'est pourquoi l'alignement compte.
+        {
+            QStringList counts;
+            for (int j = 0; j < rows; ++j)
+            {
+                for (int k = 0; k < columns; ++k)
+                {
+                    if (!usedCells[j * columns + k])
+                    {
+                        continue;
+                    }
+
+                    const Path64 cell = RectPath(cellW * k, cellH * j, cellW, cellH);
+                    int touching = 0;
+                    for (const Path64 &c : contours)
+                    {
+                        if (!Clipper2Lib::Intersect({c}, {cell},
+                                                    Clipper2Lib::FillRule::NonZero).empty())
+                        {
+                            ++touching;
+                        }
+                    }
+
+                    counts.append(QStringLiteral("%1:%2=%3").arg(j + 1).arg(k + 1).arg(touching));
+                }
+            }
+
+            std::printf("pieces par case        : %s\n",
+                        qPrintable(counts.join(QLatin1Char(' '))));
+        }
         std::printf("plancher de feuilles   : %6d   (surface / surface d'une feuille)\n",
                     floorSheets);
         std::printf("lignes de coupe        : %d verticales + %d horizontales\n",

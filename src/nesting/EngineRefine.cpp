@@ -144,14 +144,14 @@ bool Engine::refine(const Bin &bin,
     // What the first pass kept clear, this pass must keep clear too — every
     // forbidden zone, at its absolute place, joined into one region. The same
     // builder the first pass uses, so the two passes cannot disagree about
-    // where a forbidden page is (see Engine::buildZoneGeom).
+    // where a forbidden page is (see NestZone::Build).
     //
     // This used to be impossible: the zone geometry lived inside
     // placeSequential and was not reachable here, so the pass refused to run at
     // all as soon as the bin carried an obstacle. The refusal is gone with the
     // reachability — and it was the obstacle-plus-grid combination, the one a
     // tiled plan with forbidden pages needs, that it made unreachable.
-    const Clipper2Lib::Paths64 forbidden = absoluteZonePaths(buildZoneGeom(bin, gapR));
+    const Clipper2Lib::Paths64 forbidden = NestZone::Absolute(NestZone::Build(bin.zones(), gapR));
 
     // The envelope comes from the very number the host application stores and
     // turns into a page count — never from a local recomputation, which would

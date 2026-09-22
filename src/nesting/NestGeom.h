@@ -13,7 +13,10 @@
  **
  **          Tout ici est INLINE et sans état : c'est un ensemble de fonctions
  **          pures, pas un objet. Aucune n'alloue de ressource, aucune ne
- **          connaît ni Bin ni Engine.
+ **          connaît ni Bin ni Engine — sauf la FORME du cache NFP, qui est un
+ **          type et une fabrique de clé, pas un état : deux moteurs qui
+ **          cachaient leurs NFP sous deux formes auraient eu deux vérités pour
+ **          une memoïsation.
  **
  **  @copyright
  **  Copyright (C) 2026 Sophie Denys <contact@sophiedenys.com>
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 #include <clipper2/clipper.h>
@@ -53,6 +57,26 @@ namespace NestGeom {
 /// appelants de ce dépôt. Les accesseurs de `Bin` s'appellent `…Mm` et mentent ;
 /// ce chiffre ne dit rien de l'unité.
 inline constexpr double kScale = 1e6;
+
+// ── The shape of the NFP cache ──────────────────────────────────────────────
+//
+// Moved here from `Engine`, where it was public and reached into by the Tiled
+// engine (`Engine::NFPCache`) — a second engine borrowing the first one's cache
+// type for a memoïsation both of them make. The cache is the NFP's, and the NFP
+// is this file's.
+//
+// ⚠️ A TYPE and a pure factory, not state: the maps themselves live in each
+// engine, for the length of one run.
+
+/// Packed key: pieceA (16b) | rotA (16b) | pieceB (16b) | rotB (16b).
+using NFPCacheKey = std::uint64_t;
+using NFPCache     = std::unordered_map<NFPCacheKey, Clipper2Lib::Paths64>;
+
+inline NFPCacheKey makeNFPCacheKey(int pieceA, int rotA, int pieceB, int rotB) noexcept
+{
+    return (std::uint64_t(pieceA) << 48) | (std::uint64_t(rotA) << 32)
+         | (std::uint64_t(pieceB) << 16) |  std::uint64_t(rotB);
+}
 
 inline BBox bboxFromPath(const Clipper2Lib::Path64 &path)
 {

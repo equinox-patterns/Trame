@@ -17,7 +17,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <unordered_map>
 #include <vector>
 
 #include <clipper2/clipper.h>
@@ -25,6 +24,7 @@
 
 #include "model/Placement.h"
 #include "nesting/NestGeom.h"
+#include "nesting/ZoneGeom.h"
 
 class Bin;
 
@@ -71,15 +71,16 @@ public:
 
     // ── NFP cache ──────────────────────────────────────────────────────────
 
-    /// Packed key: pieceA (16b) | rotA (16b) | pieceB (16b) | rotB (16b).
-    using NFPCacheKey = std::uint64_t;
-    using NFPCache     = std::unordered_map<NFPCacheKey, Clipper2Lib::Paths64>;
-
-    static NFPCacheKey makeNFPCacheKey(int pieceA, int rotA, int pieceB, int rotB) noexcept
-    {
-        return (std::uint64_t(pieceA) << 48) | (std::uint64_t(rotA) << 32)
-             | (std::uint64_t(pieceB) << 16) |  std::uint64_t(rotB);
-    }
+    /// The cache's shape lives in `nesting/NestGeom.h`, with the NFP it memoïses:
+    /// both engines make that cache, so it could not stay one engine's private
+    /// arrangement. The two names are kept here because this class's own signatures
+    /// are written with them.
+    ///
+    /// `makeNFPCacheKey` is NOT re-exported: a using-declaration at class scope may
+    /// only name a base class's member, and a one-line forwarder would have been a
+    /// second name for one function. Callers name it `NestGeom::makeNFPCacheKey`.
+    using NFPCacheKey = NestGeom::NFPCacheKey;
+    using NFPCache    = NestGeom::NFPCache;
 
     explicit Engine(const Config &cfg) noexcept;
 
@@ -134,45 +135,14 @@ private:
 
     // ── Forbidden zones ──────────────────────────────────────────────────
 
-    /// One of the bin's zones, as engine geometry.
+    /// The geometry of the bin's zones lives in `nesting/ZoneGeom.h`, with the ONE
+    /// implementation of "a piece must avoid every zone" — the Tiled engine asks the
+    /// same question, so neither engine may hold the answer alone.
     ///
-    /// Normalized to its own min corner so that the per-(piece, rotation) NFP
-    /// can be cached on it and merely translated to (originX, originY): a zone's
-    /// place is then free to change without touching the cache.
-    struct ZoneGeom
-    {
-        Clipper2Lib::Path64 local;      ///< The zone, gap-inflated, normalized
-
-        /// Bounding box of the zone BEFORE inflation — the figure the
-        /// "can this zone possibly matter" test reads. Kept exactly as the A0
-        /// obstacle had it: the test is a conservative filter, and widening it
-        /// would change when a clip is skipped.
-        BBox bboxLocal;
-
-        int64_t originX = 0;  ///< Where the local min corner sits in the bin
-        int64_t originY = 0;
-    };
-
-    /// Marks the third 16-bit field of an obstacle-cache key as a ZONE index
-    /// rather than a piece index.
-    ///
-    /// The key has four fields and the obstacle NFP only ever used two of them,
-    /// which is why a single slot could not tell two zones apart — the note in
-    /// placeSequential calls that out as the first trap of this change.
-    static constexpr int kZoneKeyTag = 0xFFFF;
-
-    /// The bin's forbidden zones as engine geometry, built ONCE per run.
-    ///
-    /// Each zone comes back as its rectangle at its own place, normalized and
-    /// then inflated by the FULL gap. Rebuilding this inside placeSequential —
-    /// which runs once per annealing iteration, hundreds of times per run — was
-    /// free for one rectangle and is not for K.
-    static std::vector<ZoneGeom> buildZoneGeom(const Bin &bin, int64_t gapScaled);
-
-    /// The same zones at their absolute places, joined into one region.
-    ///
-    /// One geometry, for a pass that only ever asks "may this piece be here".
-    static Clipper2Lib::Paths64 absoluteZonePaths(const std::vector<ZoneGeom> &zones);
+    /// The alias is kept because this class's own signatures are written with it, and
+    /// because the type is what `Build` returns: naming it twice would be one truth
+    /// wearing two names.
+    using ZoneGeom = NestZone::Geom;
 
     // ── Placement ────────────────────────────────────────────────────────
 
