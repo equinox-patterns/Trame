@@ -173,10 +173,11 @@ auto Extremes(const Clipper2Lib::Paths64 &region) -> std::vector<Clipper2Lib::Po
 /// cases, et c'est précisément ce qui donne à l'alignement son prix.
 auto TouchedCells(const std::vector<Placed> &placed,
                   const std::vector<std::vector<NestGeom::RotGeom>> &rotBank, double stepDeg,
-                  int64_t sheetW, int64_t sheetH, int64_t cols, int64_t rows)
-    -> std::set<int64_t>
+                  int64_t sheetW, int64_t sheetH, int64_t cols, int64_t rows,
+                  int64_t *maxY = nullptr) -> std::set<int64_t>
 {
     std::set<int64_t> touched;
+    int64_t deepest = 0;
 
     for (const Placed &p : placed)
     {
@@ -192,6 +193,7 @@ auto TouchedCells(const std::vector<Placed> &placed,
         const Clipper2Lib::Path64 abs = NestGeom::translatePath(
             NestGeom::rotatePath(rotBank[p.pieceIdx][0].path, p.rotIdx * stepDeg), p.px, p.py);
         const BBox bb = bboxFromPath(abs);
+        deepest = std::max(deepest, bb.yMax);
 
         const int64_t c0 = std::max<int64_t>(0, bb.xMin / sheetW);
         const int64_t c1 = std::min<int64_t>(cols - 1, bb.xMax / sheetW);
@@ -212,7 +214,51 @@ auto TouchedCells(const std::vector<Placed> &placed,
         }
     }
 
+    if (maxY != nullptr)
+        *maxY = deepest;
+
     return touched;
+}
+
+/// Le nombre de RANGÉES que la hauteur réelle d'un plan coûte — **le compte de l'hôte**, pas
+/// celui de l'enveloppe gelée de la passe.
+///
+/// ⚠️ **C'est ce qui manquait, et ça valait une page.** La passe jugeait sur une grille gelée
+/// (`rows` de la passe 1) : un déplacement qui descend une pièce ne changeait donc pas son score,
+/// alors qu'il change la hauteur, donc le nombre de rangées, donc **le compte que l'hôte
+/// recalcule à la fin**. Mesuré le 22-09-2026 : la passe large faisait passer A3/Tabloid framed
+/// de 11 à 12 feuilles *sans jamais accepter une augmentation* — parce qu'elle ne regardait pas
+/// la même grille.
+auto HeightOf(const std::vector<Placed> &placed,
+              const std::vector<std::vector<NestGeom::RotGeom>> &rotBank, double stepDeg,
+              int64_t margin) -> int64_t
+{
+    int64_t deepest = 0;
+    for (const Placed &p : placed)
+    {
+        // ⚠️ **La rotation, et le margin — les deux manquaient, et les deux valaient une page.**
+        //
+        // Sans la rotation, une pièce que la passe a TOURNÉE était mesurée sur sa forme droite :
+        // le plan paraissait plus court qu'il n'est, donc le nombre de rangées était sous-estimé,
+        // donc **les cases que l'hôte va imprimer étaient invisibles à la passe** — et son
+        // `after <= before` pouvait être vrai pendant que le compte de l'hôte montait. C'est
+        // exactement pour ça qu'une passe qui n'acceptait « jamais » d'augmentation en produisait
+        // une, trois fois de suite.
+        //
+        // Sans le margin, on oubliait ce que `Engine::UsedHeight` ajoute (`return usedHeight +
+        // bin.marginMm()`), donc la dernière rangée pouvait être comptée en moins.
+        const BBox bb = bboxFromPath(NestGeom::translatePath(
+            NestGeom::rotatePath(rotBank[p.pieceIdx][0].path, p.rotIdx * stepDeg), p.px, p.py));
+        deepest = std::max(deepest, bb.yMax);
+    }
+    return deepest + margin;
+}
+
+auto RowsOf(int64_t deepestY, int64_t sheetH) -> int64_t
+{
+    if (sheetH <= 0 || deepestY <= 0)
+        return 1;
+    return std::max<int64_t>(1, (deepestY + sheetH - 1) / sheetH);
 }
 
 } // anonymous namespace
@@ -303,7 +349,12 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             const BBox b = bboxFromPath(pieces[i]);
             const double w = static_cast<double>(b.xMax - b.xMin);
             const double h = static_cast<double>(b.yMax - b.yMin);
-            byHolder.emplace_back(w * h, i);
+            // L'ordre demandé — la surface par défaut, la hauteur ou la largeur sinon. C'est le
+            // seul levier de cette variante : mêmes pièces, même moteur, un autre départ.
+            const double key = m_spec.order == Spec::Order::HolderHeight ? h
+                               : m_spec.order == Spec::Order::HolderWidth ? w
+                                                                          : w * h;
+            byHolder.emplace_back(key, i);
         }
         std::sort(byHolder.begin(), byHolder.end(),
                   [](const auto &a, const auto &b)
@@ -403,6 +454,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             // lieu de rester au bord.
             int     bestRot = -1;
             int64_t bestX = 0, bestY = 0;
+            int64_t bestBottom = 0;
 
             for (int rIdx = 0; rIdx < numRots; ++rIdx)
             {
@@ -419,11 +471,24 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 if (pos.y >= envH)
                     continue;
 
-                if (bestRot < 0 || pos.y < bestY || (pos.y == bestY && pos.x < bestX))
+                // **Le BAS le plus haut, et non le HAUT le plus haut.** C'est la règle qui
+                // posait la pièce dans la mauvaise orientation — le diagnostic de Sophie, mot pour
+                // mot : « la rotation validée par le moteur est fausse puisqu'elle ne permet pas de
+                // mettre la pièce plus haut ».
+                //
+                // Comparer `pos.y` seul garde l'orientation dont le coin de départ monte le plus,
+                // **sans regarder la hauteur** : une pièce peut partir de haut et descendre loin,
+                // occuper beaucoup de place vers le bas, et ne plus pouvoir remonter ensuite. Ce
+                // qu'elle fait à la main, c'est TOURNER la pièce pour qu'elle descende moins — donc
+                // le chiffre à comparer est son bord inférieur : `pos.y + bg.bbox.yMax`.
+                const int64_t bottom = pos.y + rotBank[pieceIdx][rIdx].bbox.yMax;
+
+                if (bestRot < 0 || bottom < bestBottom || (bottom == bestBottom && pos.x < bestX))
                 {
-                    bestRot = rIdx;
-                    bestX   = pos.x;
-                    bestY   = pos.y;
+                    bestRot    = rIdx;
+                    bestX      = pos.x;
+                    bestY      = pos.y;
+                    bestBottom = bottom;
                 }
             }
 
@@ -481,31 +546,21 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     const int64_t sheetW = static_cast<int64_t>(m_spec.sheetWidth * kScale);
     const int64_t cols = sheetW > 0 ? binW / sheetW : 0;
 
-    // ⚠️ **INERTE, et pas par prudence de principe : par constat.** Mesurée le 22-09-2026,
-    // Tabloid en 4 colonnes : sur le run SANS page de garde elle n'accepte aucun déplacement —
-    // donc elle ne gagne rien — et sur le run AVEC page de garde elle en accepte un **en croyant
-    // gagner une case qu'elle n'a pas gagnée** : le plan change, le compte ne bouge pas.
-    //
-    // La cause est nommée : `TouchedCells` reconstruit le contour d'une pièce posée par
-    // `rotBank[i][r].path` translaté de `(px, py)`, et **ce n'est pas le contour sur lequel
-    // `OExportSheets::Compute` compte** — les deux divergent d'au moins une case. Une passe qui
-    // court après un fantôme déplace des pièces sans rien gagner, et un plan modifié pour rien
-    // est pire qu'un plan non optimisé.
-    //
-    // Ce qui la débloquera, dans cet ordre :
-    //   1. reconstruire le contour **exactement** comme l'autorité le fait ;
-    //   2. **prouver** l'accord sur le plan glouton — les deux comptes doivent coïncider avant
-    //      qu'un seul déplacement soit tenté, et faire échouer la passe sinon ;
-    //   3. re-mesurer : `cellules vides` et `feuilles imprimees` avant/après, sur Tabloid 4
-    //      colonnes et sur A3 4 colonnes.
-    //
-    // Le coût, lui, est déjà mesuré et il est nul : 6,0 s contre 5,8 s (§24 de la spec).
+    // Le meilleur plan traversé par la passe. Vide quand elle n'a pas tourné — et c'est ce vide
+    // qui dit « rien à restaurer ».
+    std::vector<Placed> bestPlaced;
+
     if (sheetW > 0 && cols > 1 && rows > 1 && placed.size() > 1)
     {
         // Règle d'arrêt simple et borne dure : on refait un tour tant qu'un déplacement a été
         // accepté, plafonné. Le coût par run est un point ouvert de la spec (§24.7), et une borne
         // se mesure ; une boucle qui ne se termine pas, non.
-        constexpr int kMaxRounds = 4;
+        // **L'étroite a ses propres tours, et le large vient après.** Ce n'est pas un réglage :
+        // mesuré le 22-09-2026, ouvrir les candidates larges dès le premier tour fait repasser
+        // A3/Tabloid framed de 11 à 12 feuilles — la marche part ailleurs AVANT que l'étroite ait
+        // fini de gagner sa page, et ne revient jamais sur le chemin qu'elle avait pris.
+        constexpr int kNarrowRounds = 3;
+        constexpr int kMaxRounds    = 6;
 
         // **Le déplacement NEUTRE est accepté** (`<=` plus bas, et non `<`), et c'est toute
         // l'idée. Mesuré le 22-09-2026 : avec la règle stricte la passe n'accepte RIEN sur
@@ -534,6 +589,30 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
         };
         seen.insert(StateKey());
 
+        // ⚠️ **LE MEILLEUR VU, et pas celui où la marche s'arrête.** Une marche qui accepte des
+        // déplacements NEUTRES dérive : elle ne perd jamais de page, mais elle peut s'éloigner du
+        // chemin qui en gagnait une et **rendre un état moins bon que celui qu'elle a traversé**.
+        // Mesuré le 22-09-2026 : les tours larges faisaient repasser A3/Tabloid framed de 11 à 12
+        // feuilles alors qu'aucun déplacement n'acceptait d'augmentation.
+        //
+        // On mémorise donc le meilleur plan rencontré, sur la grille RÉELLE — celle que l'hôte
+        // recalculera — et c'est lui qu'on rend. Les tours larges ne peuvent alors qu'aider.
+        const int64_t bestRows0 = RowsOf(HeightOf(placed, rotBank, stepDeg, margin), sheetH);
+        int bestCount = static_cast<int>(
+            TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, bestRows0).size());
+        bestPlaced = placed;
+
+        const auto HarvestBest = [&]() {
+            const int64_t rowsNow = RowsOf(HeightOf(placed, rotBank, stepDeg, margin), sheetH);
+            const int now = static_cast<int>(
+                TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rowsNow).size());
+            if (now < bestCount)
+            {
+                bestCount  = now;
+                bestPlaced = placed;
+            }
+        };
+
         int accepted = 0;
         const int maxAccepted = static_cast<int>(placed.size()) * 4;
 
@@ -545,20 +624,37 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             {
                 const Placed candidate = placed[i];
 
-                // Seule une pièce qui touche la DERNIÈRE rangée peut faire gagner une page : plus
-                // haut, elle ne coûte rien à vider, et la déplacer ne peut que déplacer le
-                // problème.
-                const BBox candidateBB = bboxFromPath(NestGeom::translatePath(
-                    NestGeom::rotatePath(rotBank[candidate.pieceIdx][0].path,
-                                         candidate.rotIdx * stepDeg),
-                    candidate.px, candidate.py));
-                if (candidateBB.yMax < (rows - 1) * sheetH)
+                // **Le premier tour est ÉTROIT, les suivants sont LARGES — et cet ordre est
+                // tout.** Le tour étroit ne considère que les pièces qui touchent la dernière
+                // rangée : c'est là que se trouve le gain évident, celui que Sophie reprend à la
+                // main. Les tours suivants s'ouvrent à TOUTES les pièces, parce qu'un gain plus
+                // profond commence ailleurs — mesuré le 22-09-2026 sur A3/Tabloid framed : il
+                // passe par une GROSSE PIÈCE DU HAUT qu'il faut TOURNER pour qu'elle prenne
+                // moins de place et libère le passage à une pièce du fond.
+                //
+                // ⚠️ **L'ordre n'est pas un détail de réglage : il décide du résultat.** Ouverte
+                // d'emblée, la passe large accepte trop de déplacements neutres, part ailleurs, et
+                // **ne retrouve plus le chemin que l'étroite trouvait** — mesuré : A3/Tabloid
+                // framed repassait de 11 à 12, et le run doublait. Étroite d'abord, large ensuite :
+                // le compte ne peut jamais remonter, donc rien de gagné ne se perd.
+                if (round < kNarrowRounds)
                 {
-                    continue;
+                    const BBox candidateBB = bboxFromPath(NestGeom::translatePath(
+                        NestGeom::rotatePath(rotBank[candidate.pieceIdx][0].path,
+                                             candidate.rotIdx * stepDeg),
+                        candidate.px, candidate.py));
+                    if (candidateBB.yMax < (rows - 1) * sheetH)
+                    {
+                        continue;
+                    }
                 }
 
+                // ⚠️ La grille RÉELLE, pas l'enveloppe gelée : c'est celle que l'hôte
+                // recalculera sur la hauteur finale, et deux grilles différentes font deux
+                // comptes différents.
+                const int64_t rowsBefore = RowsOf(HeightOf(placed, rotBank, stepDeg, margin), sheetH);
                 const std::set<int64_t> before =
-                    TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rows);
+                    TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rowsBefore);
 
                 // La pièce est retirée du plan, puis reposée au plus haut possible : la mécanique
                 // de la passe 1, avec une pièce de moins. L'enveloppe est GELÉE — une pièce ne
@@ -594,8 +690,9 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                         }
 
                         placed[i] = {candidate.pieceIdx, rIdx, pos.x, pos.y};
+                        const int64_t rowsAfter = RowsOf(HeightOf(placed, rotBank, stepDeg, margin), sheetH);
                         const std::set<int64_t> after =
-                            TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rows);
+                            TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rowsAfter);
 
                         // Neutre accepté, augmentation refusée — voir la note au-dessus de
                         // `seen` — et jamais deux fois le même plan.
@@ -607,6 +704,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                             ++accepted;
                             improved = true;
                             moved    = true;
+                            HarvestBest();
                             break;
                         }
 
@@ -619,6 +717,15 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             {
                 break;
             }
+        }
+
+        // **Le meilleur plan traversé, et non celui où la marche s'est arrêtée.** Sans cela, une
+        // marche qui accepte des déplacements neutres dérive et rend moins que ce qu'elle a vu.
+        for (const Placed &q : bestPlaced)
+        {
+            out[q.pieceIdx].x        = static_cast<double>(q.px) / kScale;
+            out[q.pieceIdx].y        = static_cast<double>(q.py) / kScale;
+            out[q.pieceIdx].rotation = q.rotIdx * stepDeg;
         }
     }
 

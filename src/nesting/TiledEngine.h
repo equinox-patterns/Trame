@@ -56,6 +56,22 @@ public:
     /// reader has to rule out is a struct that lies about what matters.
     struct Spec
     {
+        /// **L'ordre dans lequel les pièces sont posées.** Le moteur est glouton : il pose, et ne
+        /// revient jamais. La PREMIÈRE pièce prend la meilleure place, la dernière se contente du
+        /// reste — donc l'ordre décide de tout le plan.
+        ///
+        /// Trois ordres, trois plans complets, à partir des mêmes pièces. C'est l'application qui
+        /// les compare et garde celui qui imprime le moins de pages : **le moteur ne sait pas ce
+        /// qu'est une feuille**, et n'a pas à le savoir.
+        enum class Order
+        {
+            HolderArea,    ///< la surface du holder, décroissante — l'ordre historique
+            HolderHeight,  ///< la hauteur, décroissante — l'ordre du rangeur d'étagères
+            HolderWidth    ///< la largeur, décroissante
+        };
+
+        Order order{Order::HolderArea};
+
         /// One sheet, in the caller's unit (pixels here, as everywhere).
         double sheetWidth  = 0.0;
         double sheetHeight = 0.0;
