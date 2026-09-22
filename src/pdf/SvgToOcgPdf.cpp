@@ -345,7 +345,14 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
         // box in Ostara, and a tiled single-size run would open one PER SHEET.
         qDebug() << "SvgToOcgPdf: no layer group, writing a flat page";
 
-        const QByteArray pdfBuf = renderToPdfBuffer(svgData, result.page);
+        // ⚠️ **The words are taken out and redrawn — exactly as they are for a layer.**
+        //
+        // Left as they stand, they go out as real text with no font behind them: `BT /F11 40 Tf`,
+        // a name that resolves to nothing, and a reader that substitutes a face of its own. That is
+        // the defect this branch has always carried — §13.1 of the export spec, measured: zero
+        // `/Font` objects in the file. **A page is supposed to look the way the application shows
+        // it**, so here, as everywhere, the letters are contours.
+        const QByteArray pdfBuf = renderToPdfBuffer(buildWholeSvg(doc, result.page), result.page);
         if (pdfBuf.isEmpty()) {
             qWarning() << "SvgToOcgPdf: failed to render the document";
             return result;
@@ -366,6 +373,10 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
         whole.name = QStringLiteral("Document");
         whole.stream = stream;
         whole.plain = true;
+        // The words, redrawn from their outlines — and outside every optional content group, since
+        // a document with no layer has nothing to switch off.
+        whole.textStream = emitMepTextAsPdfOps(doc.documentElement(), result.page,
+                                               result.alphaStates);
 
         result.layers.append(whole);
         result.plain = true;
@@ -1734,7 +1745,10 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         // different hands and must not share a CTM. One form holds both, each in its own
         // q/Q.
         QByteArray content;
-        if (layer->isMep) {
+        // **A text stream is written whenever there is one** — the decor layer's, and the flat
+        // document's, which has no layer at all. Whether it is MARKED is another question, asked
+        // where the page is written; what belongs here is that the words reach the file.
+        if (!layer->textStream.isEmpty()) {
             content.append("q\n");
             content.append(layer->stream);
             content.append("\nQ\n");
