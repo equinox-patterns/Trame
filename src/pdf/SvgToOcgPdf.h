@@ -122,12 +122,38 @@ public:
     ///                 With this false the underlay is unconditional, as it has always been —
     ///                 which is why the safe setting is the one that has no layer at all.
     /// @return true on success
+    /// @param coverSvgPath  A second document, drawn on every page OVER the underlay, UNDER the
+    ///                 layers, and outside every optional content group. Empty — the default — is
+    ///                 a document with no cover page.
+    ///
+    ///                 It is NOT laid out on the plan's page, unlike the underlay: a cover page is
+    ///                 a page of its own size, which is exactly what its format gives it. Its own
+    ///                 placement is therefore read from its streams and undone, and the plan's put
+    ///                 back in its place, so that it lands where the caller's own coordinates say
+    ///                 on every sheet — the sheet it is on, and the sheets it is not.
+    ///
+    ///                 Nothing in the reader's panel reaches it, whatever @p mepIsLayer says: the
+    ///                 cover page is not the layout, and a document that can be delivered without
+    ///                 its nomenclature is a document nobody should be able to make by accident.
+    /// @param coverSheet  The sheet the cover page stands on when its format gives it one of its
+    ///                 own, in the same coordinates as @p pages. Empty — the default — leaves the
+    ///                 cover page on the plan's own sheets, which is where a format whose sheet can
+    ///                 hold it puts it.
+    ///
+    ///                 **A grafted sheet carries the cover page and nothing else.** It is written
+    ///                 FIRST, so the file opens on it. None of the plan is invoked there — not the
+    ///                 layers, not the underlay — and that is not an economy: the plan's own frame
+    ///                 straddles its outer edge, and a sheet placed against it would print the half
+    ///                 of that line which bleeds. A cover page's sheet holds the cover page.
+    /// @return true on success
     bool convert(const QString     &svgPath,
                  const QVector<QRectF> &pages,
                  const QString     &pdfPath,
                  const DocumentInfo &info = {},
                  const QString     &underlaySvgPath = QString(),
-                 bool               mepIsLayer = true);
+                 bool               mepIsLayer = true,
+                 const QString     &coverSvgPath = QString(),
+                 const QRectF      &coverSheet = QRectF());
 
 private:
     struct PageInfo
@@ -173,6 +199,30 @@ private:
         bool isEmpty() const { return stream.isEmpty() && textStream.isEmpty(); }
     };
 
+    /// @brief The cover page's document, drawn on every sheet and outside every layer.
+    ///
+    /// It shares the underlay's first property and not its second. Like the underlay it is not a
+    /// layer and never becomes one: no entry in the reader's panel switches it, and no combination
+    /// of layer states can hide it. A cover page that can be switched off is a plan delivered
+    /// without its nomenclature, and it looks perfectly normal that way — which is the silent kind
+    /// of wrong, and the whole reason this is not optional content.
+    ///
+    /// **Unlike the underlay, its page is its own.** The cover page is 19 × 25.9 cm wherever its
+    /// format puts it, which is not the plan's size; forcing it onto the plan's page is what the
+    /// underlay does and what would then crop it. So its rendered streams carry the placement of
+    /// ITS page, and the page stream re-places them against the plan's own frame — read, not
+    /// assumed, the way the underlay's placement is compared rather than trusted.
+    struct Cover
+    {
+        /// Its own page, which is what its placement is read against when the stream's cm cannot
+        /// be read — the same page the caller laid it out on.
+        PageInfo   page;
+        QByteArray stream;     // the shapes, as the renderer drew them
+        QByteArray textStream; // the text, re-emitted as path operators, its own CTM
+
+        bool isEmpty() const { return stream.isEmpty() && textStream.isEmpty(); }
+    };
+
     /// @brief One SVG, read back: its page, and the rendered content of each of its layers.
     ///
     /// Everything the writer needs, and nothing else: once this value exists the document
@@ -186,6 +236,7 @@ private:
         QVector<LayerContent> layers;
         bool                  plain{false}; ///< no layer group at all: a single-size document
         Underlay              underlay;     ///< empty when the caller asked for none
+        Cover                 cover;        ///< empty when the caller asked for none
 
         /// Every alpha state the content above calls by name, whichever layer or document it
         /// came from. Document-wide rather than per layer, because a Form's /Resources is the
@@ -207,12 +258,14 @@ private:
     QByteArray          buildLayerSvg(const QDomDocument &origDoc,
                                       const QDomElement   &layerEl,
                                       const PageInfo      &page) const;
-    /// @brief The underlay document, whole, laid out on the plan's own page.
+    /// @brief A document of its own, whole, laid out on the page it is given.
     ///
-    /// The same root as a layer's — the plan's size and viewBox — because the two land on
-    /// the paper together; but every top-level child comes along, not one group of them,
-    /// since an underlay has no layer groups to pick a group from.
-    QByteArray          buildUnderlaySvg(const QDomDocument &origDoc, const PageInfo &page) const;
+    /// The root a layer's would have — that page's size and viewBox — with every top-level child
+    /// carried over, not one group of them: neither an underlay nor a cover page is authored with
+    /// layer groups. The page is the caller's, and the two callers differ on purpose — the
+    /// underlay's is the plan's, because the two land on the paper together, and the cover page's
+    /// is its own, because a cover page is a page.
+    QByteArray          buildWholeSvg(const QDomDocument &origDoc, const PageInfo &page) const;
     /// @brief Read the underlay document into the streams a page will invoke it by.
     ///
     /// Refuses a document laid out to other figures than the plan's: it is drawn through
@@ -236,7 +289,7 @@ private:
     /// to need are not its to allocate — the file is not being built yet at the time it runs.
     /// It appends what it used and names it, and buildOcgPdf allocates the lot later.
     QByteArray          emitMepTextAsPdfOps(const QDomElement &root,
-                                              double           pageHeightPt,
+                                              const PageInfo   &page,
                                               AlphaStates     &alpha) const;
     /// @brief Read one SVG into its page and the rendered content of each of its layers.
     ///
@@ -244,7 +297,16 @@ private:
     /// tiled conversion can call it once per sheet. The caller gets a value it can hold;
     /// nothing here depends on there being exactly one document.
     SvgContent          readSvg(const QString &svgPath,
-                                const QString &underlaySvgPath = QString());
+                                const QString &underlaySvgPath = QString(),
+                                const QString &coverSvgPath = QString());
+
+    /// @brief Read the cover page's document into the streams a page will invoke it by.
+    ///
+    /// No page is compared to the plan's, and that is deliberate: the cover page has a page of its
+    /// own, and demanding the plan's would refuse the very document this is for. What takes the
+    /// underlay's place here is the placement correction in buildOcgPdf — the streams are drawn
+    /// through the plan's translation, so their own placement has to be undone first.
+    bool                readCover(const QString &svgPath, Cover &out, AlphaStates &alpha);
 
     /// @brief Write @p doc as one PDF, one page per rectangle, over a single layer set.
     ///
@@ -257,7 +319,8 @@ private:
                                     const SvgContent      &doc,
                                     const QVector<QRectF> &pages,
                                     const DocumentInfo    &info,
-                                    bool                   mepIsLayer);
+                                    bool                   mepIsLayer,
+                                    const QRectF          &coverSheet = QRectF());
 };
 
 #endif // SVGTOOCGPDF_H

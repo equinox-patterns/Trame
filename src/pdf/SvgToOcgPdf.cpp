@@ -256,7 +256,8 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
                           const QString &pdfPath, const DocumentInfo &info,
-                          const QString &underlaySvgPath, bool mepIsLayer)
+                          const QString &underlaySvgPath, bool mepIsLayer,
+                          const QString &coverSvgPath, const QRectF &coverSheet)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: no page to write";
@@ -273,7 +274,7 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         }
     }
 
-    const SvgContent doc = readSvg(svgPath, underlaySvgPath);
+    const SvgContent doc = readSvg(svgPath, underlaySvgPath, coverSvgPath);
     if (!doc.ok) {
         // An unreadable document is not a plan with one sheet missing: it is every sheet
         // wrong, because they all draw the same thing. Handing over nothing beats handing
@@ -282,7 +283,7 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         return false;
     }
 
-    return buildOcgPdf(pdfPath, doc, pages, info, mepIsLayer);
+    return buildOcgPdf(pdfPath, doc, pages, info, mepIsLayer, coverSheet);
 }
 
 namespace
@@ -294,7 +295,8 @@ void CollectAlphaStates(const QByteArray &pdfBuf, const QByteArray &stream, Alph
 }  // namespace
 
 SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
-                                              const QString &underlaySvgPath)
+                                              const QString &underlaySvgPath,
+                                              const QString &coverSvgPath)
 {
     SvgContent result;
 
@@ -322,6 +324,14 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
     // none: a frame that made it onto half the paper would be worse than no export at all.
     if (!underlaySvgPath.isEmpty()
         && !readUnderlay(underlaySvgPath, result.page, result.underlay, result.alphaStates)) {
+        return result; // ok stays false
+    }
+
+    // The cover page is read the same way and for the same reason — on every sheet or on none —
+    // and refuses nothing of the plan's: it has a page of its own by design. What stands in for
+    // the underlay's size check is the placement correction in buildOcgPdf.
+    if (!coverSvgPath.isEmpty()
+        && !readCover(coverSvgPath, result.cover, result.alphaStates)) {
         return result; // ok stays false
     }
 
@@ -390,8 +400,7 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
         // For MEP layer, generate text as PDF path operators
         // (kept separate — must not be affected by QSvgRenderer's CTM)
         if (layer.isMep) {
-            const double pageHeightPt = result.page.sizeMm.height() * kPointsPerMm;
-            textStream = emitMepTextAsPdfOps(layer.element, pageHeightPt, result.alphaStates);
+            textStream = emitMepTextAsPdfOps(layer.element, result.page, result.alphaStates);
         }
 
         result.layers.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
@@ -554,7 +563,7 @@ QByteArray SvgToOcgPdf::buildLayerSvg(const QDomDocument &origDoc,
     return layerDoc.toByteArray(-1); // -1 = no indent, compact XML
 }
 
-QByteArray SvgToOcgPdf::buildUnderlaySvg(const QDomDocument &origDoc, const PageInfo &page) const
+QByteArray SvgToOcgPdf::buildWholeSvg(const QDomDocument &origDoc, const PageInfo &page) const
 {
     QDomDocument underlayDoc;
 
@@ -608,7 +617,7 @@ bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
         return false;
     }
 
-    const QByteArray pdfBuf = renderToPdfBuffer(buildUnderlaySvg(doc, plan), plan);
+    const QByteArray pdfBuf = renderToPdfBuffer(buildWholeSvg(doc, plan), plan);
     if (pdfBuf.isEmpty()) {
         qWarning() << "SvgToOcgPdf: failed to render the underlay";
         return false;
@@ -625,8 +634,56 @@ bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
     // path operators, in a scope of its own.
     CollectAlphaStates(pdfBuf, out.stream, alpha);
 
-    out.textStream = emitMepTextAsPdfOps(doc.documentElement(),
-                                         plan.sizeMm.height() * kPointsPerMm, alpha);
+    out.textStream = emitMepTextAsPdfOps(doc.documentElement(), plan, alpha);
+    return true;
+}
+
+bool SvgToOcgPdf::readCover(const QString &svgPath, Cover &out, AlphaStates &alpha)
+{
+    QFile file(svgPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        qWarning() << "SvgToOcgPdf: cannot open the cover page" << svgPath;
+        return false;
+    }
+    const QByteArray data = file.readAll();
+    file.close();
+
+    QDomDocument doc;
+    QString errorMsg;
+    int errorLine, errorCol;
+    if (!doc.setContent(data, &errorMsg, &errorLine, &errorCol)) {
+        qWarning() << "SvgToOcgPdf: XML parse error in the cover page at line" << errorLine
+                   << ":" << errorMsg;
+        return false;
+    }
+
+    // **Its own page, and nothing of the plan's is compared to it.** The underlay is refused when
+    // its page is not the plan's because it is drawn through the plan's translation and has no
+    // other answer; the cover page is the opposite case, and demanding the plan's figures would
+    // refuse the very document this exists for. Where the underlay is checked, the cover is
+    // re-placed — see buildOcgPdf, which reads what Qt actually wrote.
+    out.page = getPageInfo(doc);
+
+    // The same two steps the underlay takes, on the page this document declares rather than on the
+    // plan's: rendered at its own size, and with its text re-emitted as path operators, because a
+    // form carries no font.
+    const QByteArray pdfBuf = renderToPdfBuffer(buildWholeSvg(doc, out.page), out.page);
+    if (pdfBuf.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: failed to render the cover page";
+        return false;
+    }
+
+    out.stream = extractContentStream(pdfBuf);
+    if (out.stream.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: failed to extract the cover page stream";
+        return false;
+    }
+
+    CollectAlphaStates(pdfBuf, out.stream, alpha);
+
+    // The page goes with it, and not merely its height: this document's viewBox does not begin at
+    // the origin, and the re-emission reads both axes off the page it is given.
+    out.textStream = emitMepTextAsPdfOps(doc.documentElement(), out.page, alpha);
     return true;
 }
 
@@ -1031,11 +1088,24 @@ QByteArray SvgToOcgPdf::decompressFlate(const QByteArray &compressed)
     return result;
 }
 
-QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
-                                               double           pageHeightPt,
-                                               AlphaStates     &alpha) const
+QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root, const PageInfo &page,
+                                            AlphaStates &alpha) const
 {
     QByteArray buf;
+
+    // **The page the text was laid out on, and not only its height.** A baseline lands at
+    // `pageHeightPt − y` and an origin at `x · scl`, which is right only while the document's
+    // viewBox starts at the origin — which is the case for a plan, for the underlay, and for
+    // nothing else. A cover page carries its own place in its viewBox, so BOTH axes are read off
+    // the page here: one of them ignored moves a whole page of text aside, silently, and the file
+    // looks perfectly ordinary from the outside.
+    //
+    // For a document whose viewBox does start at the origin — every caller but the cover page —
+    // `k` is 1 and both origins are 0, so the arithmetic collapses to what it has always been.
+    const double k = (page.viewBox.width() > 0.0)
+                         ? page.sizeMm.width() * kPixelsPerMm / page.viewBox.width()
+                         : 1.0;
+    const double pageHeightPt = page.sizeMm.height() * kPointsPerMm;
 
     // Walk recursively and find all <text> elements
     std::function<void(const QDomElement &, const Affine2D &)> walk =
@@ -1115,7 +1185,17 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
                 const int num = fontWeight.toInt(&ok);
                 if (ok) font.setWeight(static_cast<QFont::Weight>(num));
             }
-            font.setStyleName(QString());
+            // **The face the document names, when it names one.** Ostara writes the style name of
+            // the face it drew with — « SemiBold », « Book », whatever that family's designer
+            // called it — because a weight NUMBER names no face: the same 300 is « Light » in one
+            // family and « ExtraLight » in the next, and asking for 900 draws « ExtraBold ».
+            // Measured on the fonts installed here. Carried by name, the page keeps the very face
+            // the application used, whatever font the user has.
+            //
+            // A document that names none — every file written before this — keeps the weight it
+            // declares, and the style name is cleared so that Qt does not resolve against a name
+            // the drawing never carried.
+            font.setStyleName(el.attribute(QStringLiteral("ostara:font-face")));
 
             // Generate text outline path
             QPainterPath textPath;
@@ -1137,8 +1217,11 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root,
             const double b_coord = scl * sn;
             const double cc = scl * sn;
             const double d  = -scl * c;
-            const double xPt = px * scl;
-            const double yPt = pageHeightPt - py * scl;
+            // The user point brought to points through the page's own mapping, viewBox origin
+            // included — the same mapping the renderer used for the shapes beside this text.
+            const double xPt = (px - page.viewBox.left()) * k * scl;
+            const double yPt =
+                scl * (page.sizeMm.height() * kPixelsPerMm - (py - page.viewBox.top()) * k);
 
             buf.append("q\n");
             buf.append(QStringLiteral("%1 %2 %3 %4 %5 %6 cm\n")
@@ -1323,7 +1406,8 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                                const SvgContent      &doc,
                                const QVector<QRectF> &pages,
                                const DocumentInfo    &info,
-                               bool                   mepIsLayer)
+                               bool                   mepIsLayer,
+                               const QRectF          &coverSheet)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: nothing to write";
@@ -1463,8 +1547,15 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
     // over beside them, because a third figure to keep in agreement with the other two is
     // a third figure that can disagree. It serves one thing only — sizing the /BBox — and
     // takes no part in the page arithmetic.
+    // The sheets this file is made of: the cover page's own, when its format gives it one, and
+    // then the plan's. It is FIRST — a cover page opens what it covers — and the plan's own figure
+    // is taken over the two of them, because the /BBox has to hold whatever any page shows.
+    QVector<QRectF> sheets = pages;
+    if (!coverSheet.isEmpty())
+        sheets.prepend(coverSheet);
+
     QRectF plan;
-    for (const QRectF &page : pages)
+    for (const QRectF &page : sheets)
         plan = plan.united(page);
 
     // Where Qt placed the drawing inside a rendered stream, read off the streams instead of
@@ -1521,6 +1612,69 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                            << found.a << found.d << found.f << "against"
                            << placement.a << placement.d << placement.f;
             }
+        }
+    }
+
+    // ── The cover page, and the TWO cms Qt writes ───────────────────────────────────────────
+    //
+    // A stream Qt renders opens with two `cm`, and they say different things. The first is the
+    // engine's page: `0.75 0 0 -0.75 0 <height>`, which is what ReadPlacement names a placement.
+    // The second is the painter's mapping of the document's viewBox onto that page:
+    // `<k> 0 0 <k> <-k·vbX> <-k·vbY>`.
+    //
+    // **The two coincide only while the viewBox starts at the origin** — which is the case for a
+    // plan, for the underlay, and for nothing else. A cover page is laid out where its format puts
+    // it, so its viewBox carries the place, and reading the first cm alone places its drawing one
+    // page away from its sheet. Silently: blank paper is what a missing drawing looks like too.
+    //
+    // Measured, not reasoned — a probe on a document whose viewBox starts at (100.5, 200.25) gives
+    // `0.750000000 0 0 -0.750000000 0 734 cm`, then
+    // `1.00000032 0 0 0.999997586 -100.500033 -200.249516 cm`. The second is the painter's, and it
+    // is composed here from the page the caller declared — the module rebuilds that root itself, so
+    // the two agree by construction.
+    //
+    // What comes out of it is the cm that brings the WHOLE of that mapping into the plan's own
+    // frame: the cover's placement undone, the plan's put back. Read rather than assumed for the
+    // engine's half, for the reasons ReadPlacement gives; composed rather than guessed for the
+    // painter's, from figures the document states about itself.
+    Placement coverCorrection;
+    bool haveCoverCorrection = false;
+    if (!doc.cover.isEmpty()) {
+        const QRectF vb = doc.cover.page.viewBox;
+        // The painter's scale: the page as the document declares it, over the viewBox it maps.
+        const double k = (vb.width() > 0.0)
+                             ? doc.cover.page.sizeMm.width() * kPixelsPerMm / vb.width()
+                             : 1.0;
+
+        Placement engine;
+        if (!ReadPlacement(doc.cover.stream, engine)) {
+            // The case the plan's own reading falls back for, answered the same way: the page the
+            // document was laid out on says what Qt placed its drawing by.
+            qWarning() << "SvgToOcgPdf: no placement cm at the head of the cover page stream";
+            engine.a = kPixelToPt;
+            engine.d = -kPixelToPt;
+            engine.e = 0.0;
+            engine.f = kPixelToPt * doc.cover.page.sizeMm.height() * kPixelsPerMm;
+        }
+
+        // The painter's mapping first, the engine's after: the whole of where a user point of the
+        // cover document lands, in points.
+        Placement whole;
+        whole.a = engine.a * k;
+        whole.d = engine.d * k;
+        whole.e = engine.e - engine.a * k * vb.left();
+        whole.f = engine.f - engine.d * k * vb.top();
+
+        if (whole.a == 0.0 || whole.d == 0.0) {
+            // No scale to undo: no correction would put the drawing anywhere, and a cover page
+            // dropped in the wrong place is worse than one that is missing and says so.
+            qWarning() << "SvgToOcgPdf: the cover page has no scale to undo; it is not drawn";
+        } else {
+            coverCorrection.a = placement.a / whole.a;
+            coverCorrection.d = placement.d / whole.d;
+            coverCorrection.e = placement.e - placement.a * whole.e / whole.a;
+            coverCorrection.f = placement.f - placement.d * whole.f / whole.d;
+            haveCoverCorrection = true;
         }
     }
 
@@ -1617,12 +1771,39 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         formObjs.append(makeForm(content));
     }
 
+    // The cover page's document, written like the underlay's and invoked like it on every page —
+    // one form, rendered once. What sets it apart is not where it stands on the page but where its
+    // own placement puts it; the page stream corrects that, below.
+    int coverFormIndex = -1;
+    if (!doc.cover.isEmpty()) {
+        QByteArray content;
+        content.append("q\n");
+        content.append(doc.cover.stream);
+        content.append("\nQ\n");
+        if (!doc.cover.textStream.isEmpty()) {
+            content.append("q\n");
+            content.append(doc.cover.textStream);
+            content.append("\nQ\n");
+        }
+
+        coverFormIndex = formObjs.size();
+        formObjs.append(makeForm(content));
+    }
+
     QVector<int> pageObjs;
-    pageObjs.reserve(pages.size());
+    pageObjs.reserve(sheets.size());
 
     // One page per rectangle, in the order they were handed over — the order the sheets are
     // to be printed and taped back together in.
-    for (const QRectF &page : pages) {
+    for (int pageIndex = 0; pageIndex < sheets.size(); ++pageIndex) {
+        const QRectF &page = sheets.at(pageIndex);
+
+        // **The grafted sheet carries the cover page and nothing else.** It is not a sheet of the
+        // plan, and the plan's own frame runs along its outer edge: a line drawn on that boundary
+        // has half its width outside the plan, and a sheet placed against it prints that half.
+        // Neither the underlay nor the layers is invoked here — a cover page's sheet holds the
+        // cover page, which is the whole of what grafting a page means.
+        const bool coverOnly = !coverSheet.isEmpty() && pageIndex == 0;
         const double pageWidthPt  = placement.a * page.width();
         const double pageHeightPt = -placement.d * page.height();
 
@@ -1650,7 +1831,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         // everything. A PDF layer is a marker around a range rather than a container, so the
         // marker can travel to it here — but putting its `Do` inside the decor's own block
         // would lift the frame and the numbering over the pieces.
-        if (underlayFormIndex >= 0) {
+        if (underlayFormIndex >= 0 && !coverOnly) {
             if (mepOcg)
                 streamData.append(QStringLiteral("/OC /%1 BDC\n").arg(mepLayer->name).toUtf8());
             streamData.append(
@@ -1659,7 +1840,21 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                 streamData.append("EMC\n");
         }
 
-        for (int i = 0; i < drawing.size(); ++i) {
+        // The cover page: over the paper's own marks, under every layer, and — like the underlay —
+        // OUTSIDE every /OC block. Nothing in the reader's panel reaches it, whatever the layout
+        // layer setting says, and that is the point: a plan delivered without its nomenclature
+        // looks perfectly normal, which is why nobody should be able to make one by accident.
+        if (haveCoverCorrection) {
+            streamData.append(QStringLiteral("q\n%1 0 0 %2 %3 %4 cm\n/Fm%5 Do\nQ\n")
+                                  .arg(coverCorrection.a, 0, 'f', 6)
+                                  .arg(coverCorrection.d, 0, 'f', 6)
+                                  .arg(coverCorrection.e, 0, 'f', 6)
+                                  .arg(coverCorrection.f, 0, 'f', 6)
+                                  .arg(coverFormIndex)
+                                  .toUtf8());
+        }
+
+        for (int i = 0; !coverOnly && i < drawing.size(); ++i) {
             const LayerContent *layer = drawing.at(i);
             // The layer markers stay HERE, in the page's own stream, resolving through the
             // /Properties of the page — which is where they have always been. Only the
