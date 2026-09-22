@@ -122,6 +122,45 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
     return out;
 }
 
+/// Les points remarquables d'une région faisable — et pas seulement le coin bas-gauche.
+///
+/// **C'est là que la passe se jouait, et elle n'y arrivait pas.** `findBottomLeft` rend UN point :
+/// le plus bas puis le plus à gauche. Or **vider une case ne demande pas d'aller au plus bas** —
+/// ça demande d'en SORTIR, de quelques millimètres le long d'une frontière. Un minimum n'est
+/// jamais ce point-là, donc la passe n'avait jamais le bon candidat sous la main : mesuré le
+/// 22-09-2026, elle n'acceptait AUCUN déplacement, même en autorisant les déplacements neutres.
+///
+/// Tout point d'une région faisable est une position légale de l'origine de la pièce — bornes et
+/// dégagement compris, puisque c'est la région qui les porte. On rend donc ses extrémités : le
+/// coin bas-gauche (le placement naturel), le plus haut, le plus à gauche, le plus à droite.
+auto Extremes(const Clipper2Lib::Paths64 &region) -> std::vector<Clipper2Lib::Point64>
+{
+    std::vector<Clipper2Lib::Point64> out;
+    if (region.empty())
+        return out;
+
+    Clipper2Lib::Point64 lowest    = findBottomLeft(region);
+    Clipper2Lib::Point64 topmost   = lowest;
+    Clipper2Lib::Point64 leftmost  = lowest;
+    Clipper2Lib::Point64 rightmost = lowest;
+
+    for (const auto &path : region)
+    {
+        for (const auto &pt : path)
+        {
+            if (pt.y < topmost.y || (pt.y == topmost.y && pt.x > topmost.x))
+                topmost = pt;
+            if (pt.x < leftmost.x || (pt.x == leftmost.x && pt.y < leftmost.y))
+                leftmost = pt;
+            if (pt.x > rightmost.x || (pt.x == rightmost.x && pt.y < rightmost.y))
+                rightmost = pt;
+        }
+    }
+
+    out = {lowest, topmost, leftmost, rightmost};
+    return out;
+}
+
 /// Les cases de la grille de tuliage qu'un ensemble de pièces posées rencontre.
 ///
 /// ⚠️ **Second exemplaire assumé d'une règle dont `OExportSheets::Compute` est l'autorité** dans
@@ -461,16 +500,44 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     //      colonnes et sur A3 4 colonnes.
     //
     // Le coût, lui, est déjà mesuré et il est nul : 6,0 s contre 5,8 s (§24 de la spec).
-    constexpr bool kPagePassProved = false;
-
-    if (kPagePassProved && sheetW > 0 && cols > 1 && rows > 1 && placed.size() > 1)
+    if (sheetW > 0 && cols > 1 && rows > 1 && placed.size() > 1)
     {
         // Règle d'arrêt simple et borne dure : on refait un tour tant qu'un déplacement a été
         // accepté, plafonné. Le coût par run est un point ouvert de la spec (§24.7), et une borne
         // se mesure ; une boucle qui ne se termine pas, non.
-        constexpr int kMaxRounds = 3;
+        constexpr int kMaxRounds = 4;
 
-        for (int round = 0; round < kMaxRounds; ++round)
+        // **Le déplacement NEUTRE est accepté** (`<=` plus bas, et non `<`), et c'est toute
+        // l'idée. Mesuré le 22-09-2026 : avec la règle stricte la passe n'accepte RIEN sur
+        // Tabloid 4 colonnes — les rangées du dessus sont trop pleines pour accueillir une pièce
+        // du fond, donc aucun coup ne gagne seul. Un déplacement neutre ne gagne rien sur le
+        // moment, mais **il ouvre un trou là où il en manquait un**, et la descente qui suit
+        // trouve alors l'amélioration qu'elle ne pouvait pas atteindre.
+        //
+        // Le plan ne peut pas devenir pire pour autant : une AUGMENTATION reste refusée.
+        //
+        // Sans garde-fous, la marche neutre devient une marche au hasard. Il y en a deux, et ils
+        // sont durs : on ne repasse jamais par un plan déjà vu, et le nombre de déplacements
+        // acceptés est plafonné.
+        std::set<std::vector<int64_t>> seen;
+        const auto StateKey = [&placed]() {
+            std::vector<int64_t> key;
+            key.reserve(placed.size() * 4);
+            for (const Placed &q : placed)
+            {
+                key.push_back(q.pieceIdx);
+                key.push_back(q.rotIdx);
+                key.push_back(q.px);
+                key.push_back(q.py);
+            }
+            return key;
+        };
+        seen.insert(StateKey());
+
+        int accepted = 0;
+        const int maxAccepted = static_cast<int>(placed.size()) * 4;
+
+        for (int round = 0; round < kMaxRounds && accepted < maxAccepted; ++round)
         {
             bool improved = false;
 
@@ -507,51 +574,45 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                     }
                 }
 
-                int     bestRot = -1;
-                int64_t bestX = 0;
-                int64_t bestY = 0;
-                for (int rIdx = 0; rIdx < numRots; ++rIdx)
+                // Chaque orientation ET chaque point remarquable de sa région : on essaie POUR
+                // DE VRAI, on recompte, et on garde le premier candidat qui ne coûte rien. Ce qui
+                // est refusé est remis exactement où c'était — d'où la promesse que le plan ne
+                // peut pas sortir pire.
+                bool moved = false;
+                for (int rIdx = 0; rIdx < numRots && !moved; ++rIdx)
                 {
                     const Clipper2Lib::Paths64 region =
                         feasibleRegion(without, rotBank, rotBank[candidate.pieceIdx][rIdx],
                                        candidate.pieceIdx, rIdx, binW, rows * sheetH, margin, zones,
                                        nfpCache, obstacleCache);
-                    const Clipper2Lib::Point64 pos = findBottomLeft(region);
-                    if (pos.y >= rows * sheetH)
+
+                    for (const Clipper2Lib::Point64 &pos : Extremes(region))
                     {
-                        continue;
+                        if (pos.y >= rows * sheetH)
+                        {
+                            continue;
+                        }
+
+                        placed[i] = {candidate.pieceIdx, rIdx, pos.x, pos.y};
+                        const std::set<int64_t> after =
+                            TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rows);
+
+                        // Neutre accepté, augmentation refusée — voir la note au-dessus de
+                        // `seen` — et jamais deux fois le même plan.
+                        if (after.size() <= before.size() && seen.insert(StateKey()).second)
+                        {
+                            out[candidate.pieceIdx].x        = static_cast<double>(pos.x) / kScale;
+                            out[candidate.pieceIdx].y        = static_cast<double>(pos.y) / kScale;
+                            out[candidate.pieceIdx].rotation = rIdx * stepDeg;
+                            ++accepted;
+                            improved = true;
+                            moved    = true;
+                            break;
+                        }
+
+                        placed[i] = candidate;
                     }
-
-                    if (bestRot < 0 || pos.y < bestY || (pos.y == bestY && pos.x < bestX))
-                    {
-                        bestRot = rIdx;
-                        bestX   = pos.x;
-                        bestY   = pos.y;
-                    }
                 }
-
-                if (bestRot < 0)
-                {
-                    continue;
-                }
-
-                // Le déplacement est essayé POUR DE VRAI : on repose la pièce, on recompte, et on
-                // ne garde que si le compte a baissé. Sinon elle est remise exactement où elle
-                // était — d'où la promesse ci-dessus.
-                placed[i] = {candidate.pieceIdx, bestRot, bestX, bestY};
-                const std::set<int64_t> after =
-                    TouchedCells(placed, rotBank, stepDeg, sheetW, sheetH, cols, rows);
-
-                if (after.size() < before.size())
-                {
-                    out[candidate.pieceIdx].x        = static_cast<double>(bestX) / kScale;
-                    out[candidate.pieceIdx].y        = static_cast<double>(bestY) / kScale;
-                    out[candidate.pieceIdx].rotation = bestRot * stepDeg;
-                    improved = true;
-                    continue;
-                }
-
-                placed[i] = candidate;
             }
 
             if (!improved)
