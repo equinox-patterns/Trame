@@ -483,7 +483,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 // le chiffre à comparer est son bord inférieur : `pos.y + bg.bbox.yMax`.
                 const int64_t bottom = pos.y + rotBank[pieceIdx][rIdx].bbox.yMax;
 
-                if (bestRot < 0 || bottom < bestBottom || (bottom == bestBottom && pos.x < bestX))
+                if (bestRot < 0 || pos.y < bestY || (pos.y == bestY && pos.x < bestX))
                 {
                     bestRot    = rIdx;
                     bestX      = pos.x;
