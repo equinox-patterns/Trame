@@ -217,6 +217,14 @@ struct RotGeom
     Clipper2Lib::Path64 neg;   ///< negatePath(path)
     Clipper2Lib::Path64 aref;  ///< gap-inflated reference (== path when no inflation)
     BBox                 bbox;
+
+    /// The angle this entry was built at, in degrees.
+    ///
+    /// **Carried rather than recomputed from the index.** A piece whose direction is known is not
+    /// swept on a regular grid: its bank holds the two or four angles its grainline allows, and
+    /// those are the piece's own angles, not multiples of the step. Every reader that used to say
+    /// `index * rotationStep` reads this instead.
+    double angle = 0.0;
 };
 
 /// One RotGeom per (piece, rotation), from contours already normalized to their
@@ -231,18 +239,28 @@ struct RotGeom
 /// delivering 2.5 mm. The two-sided scheme (A and B each grown by gap/2)
 /// describes the very same forbidden region, since
 /// MinkowskiSum(A⊕g/2, -(B⊕g/2)) equals MinkowskiSum(A⊕g, -B).
+/// @param allowedAngles one list per piece, parallel to @p local. **An empty list is a piece
+///        nobody constrained**, and it keeps the whole regular sweep; a non-empty one is a piece
+///        whose direction is known, tried at those angles and at those only. A shorter vector than
+///        @p local leaves the pieces it does not reach unconstrained.
 inline std::vector<std::vector<RotGeom>>
 buildRotBank(const std::vector<Clipper2Lib::Path64> &local,
-             double rotationStep, int numRots, int64_t gapRadius)
+             double rotationStep, int numRots, int64_t gapRadius,
+             const std::vector<std::vector<double>> &allowedAngles = {})
 {
     const std::size_t N = local.size();
 
     std::vector<std::vector<RotGeom>> rotBank(N);
     for (std::size_t i = 0; i < N; ++i) {
-        rotBank[i].reserve(static_cast<std::size_t>(numRots));
-        for (int r = 0; r < numRots; ++r) {
+        const bool constrained = i < allowedAngles.size() && !allowedAngles[i].empty();
+        const int count = constrained ? static_cast<int>(allowedAngles[i].size()) : numRots;
+
+        rotBank[i].reserve(static_cast<std::size_t>(count));
+        for (int r = 0; r < count; ++r) {
             RotGeom g;
-            g.path = rotatePath(local[i], r * rotationStep);
+            g.angle = constrained ? allowedAngles[i][static_cast<std::size_t>(r)]
+                                  : r * rotationStep;
+            g.path = rotatePath(local[i], g.angle);
             ensureCCW(g.path);
             g.bbox = bboxFromPath(g.path);
             g.neg  = negatePath(g.path);
@@ -258,6 +276,25 @@ buildRotBank(const std::vector<Clipper2Lib::Path64> &local,
         }
     }
     return rotBank;
+}
+
+/// Index of the entry of @p bank built at @p angle, or -1 when the bank holds none.
+///
+/// The angles are compared modulo a full turn: a bank entry at -90° answers for 270°. **An absent
+/// angle is a real answer**: a constrained piece only has the orientations its grainline allows,
+/// and there is nothing to round to the nearest — the caller has to skip the move.
+inline int IndexOfAngle(const std::vector<RotGeom> &bank, double angle, double tolerance = 1e-6)
+{
+    for (std::size_t r = 0; r < bank.size(); ++r) {
+        double d = std::fmod(bank[r].angle - angle, 360.0);
+        if (d < 0.0) {
+            d += 360.0;
+        }
+        if (d < tolerance || 360.0 - d < tolerance) {
+            return static_cast<int>(r);
+        }
+    }
+    return -1;
 }
 
 /// Normalize every contour to its own min corner, in engine coordinates.

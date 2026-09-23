@@ -204,7 +204,9 @@ double Engine::placeSequential(const Bin &bin,
         pl.pieceIndex = pieceIdx;
         pl.x          = px / kScale;
         pl.y          = py / kScale;
-        pl.rotation   = rIdx * m_config.rotationStep;
+        // The angle the bank was built at, never the index times the step: a constrained piece
+        // has its own angles, and they are not multiples of anything.
+        pl.rotation   = rotBank[pieceIdx][static_cast<std::size_t>(rIdx)].angle;
 
         placed.push_back({pieceIdx, rIdx, px, py});
 
@@ -335,6 +337,7 @@ Engine::Engine(const Config &cfg) noexcept
 
 std::vector<Placement> Engine::place(const Bin &bin,
                                      const std::vector<Clipper2Lib::Path64> &pieces,
+                                     const std::vector<std::vector<double>> &allowedAngles,
                                      bool *abandoned) const
 {
     if (abandoned != nullptr)
@@ -364,7 +367,7 @@ std::vector<Placement> Engine::place(const Bin &bin,
     const std::vector<Clipper2Lib::Path64> local = NestGeom::normalizeToLocal(pieces);
     const std::vector<std::vector<RotGeom>> rotBank =
         NestGeom::buildRotBank(local, m_config.rotationStep, numRots,
-                               static_cast<int64_t>(m_config.gap * kScale));
+                               static_cast<int64_t>(m_config.gap * kScale), allowedAngles);
 
     // The bin's forbidden zones, as engine geometry, built ONCE for the whole
     // run: the annealing below calls placeSequential hundreds of times, and

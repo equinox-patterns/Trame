@@ -192,8 +192,10 @@ bool Engine::refine(const Bin &bin,
         if (IsAbandoned())
             return true;
 
-        const int r = static_cast<int>(std::llround(best[i].rotation / m_config.rotationStep));
-        if (r < 0 || static_cast<std::size_t>(r) >= rotBank[i].size())
+        // The angle came out of a bank, so it is IN a bank — found by angle rather than divided by
+        // the step, a constrained piece holding angles that are not multiples of anything.
+        const int r = NestGeom::IndexOfAngle(rotBank[i], best[i].rotation);
+        if (r < 0)
         {
             return false;
         }
@@ -387,8 +389,7 @@ bool Engine::refine(const Bin &bin,
             const int g0 = grazingTotal(pos);
 
             const int savedR  = rIdx[i];
-            const int numRots = static_cast<int>(rotBank[i].size());
-            const int quarter = std::max(1, static_cast<int>(std::lround(90.0 / m_config.rotationStep)));
+            const double baseAngle = rotBank[i][static_cast<std::size_t>(savedR)].angle;
 
             int                  bestG   = g0;
             std::vector<Point64> bestPos = pos;
@@ -403,17 +404,16 @@ bool Engine::refine(const Bin &bin,
             // n'apporteraient rien ici : ce que la rotation change, c'est
             // l'appartenance à un cadre, donc l'axe. Une pièce posée de travers
             // dans une grille droite ne gagne rien à pencher un peu plus.
-            for (const int offset : {0, quarter, -quarter, 2 * quarter})
+            for (const double offset : {0.0, 90.0, -90.0, 180.0})
             {
-                if (numRots <= 0)
-                {
-                    break;
-                }
-
-                int r = (savedR + offset) % numRots;
+                // Le quart de tour est demandé PAR L'ANGLE, jamais par l'index : une pièce dont la
+                // direction est connue ne tient que les angles que son droit-fil autorise, et un
+                // angle qu'elle n'a pas est SAUTÉ — l'arrondir au plus proche la coucherait en
+                // travers du droit-fil, ce que rien à l'écran ne dirait.
+                const int r = NestGeom::IndexOfAngle(rotBank[i], baseAngle + offset);
                 if (r < 0)
                 {
-                    r += numRots;
+                    continue;
                 }
 
                 rIdx[i] = r;
@@ -492,7 +492,7 @@ bool Engine::refine(const Bin &bin,
             }
 
             rIdx[i] = bestR;
-            best[i].rotation = static_cast<double>(bestR) * m_config.rotationStep;
+            best[i].rotation = rotBank[i][static_cast<std::size_t>(bestR)].angle;
 
             for (std::size_t j = 0; j < n; ++j)
             {

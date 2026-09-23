@@ -91,8 +91,14 @@ public:
     /// passed no callback can never see true. A run that was abandoned has no answer to give: its
     /// result is a half-built plan, and reading it as a finished one would place pieces that were
     /// never placed.
+    /// @param allowedAngles one list of angles per piece, parallel to @p pieces. **Empty — the
+    ///        default — leaves every piece free**, which is what the print run asks for and what
+    ///        every caller before this parameter existed got. A non-empty list pins that piece to
+    ///        the angles it holds, and the piece is never seen at any other: a piece laid on fabric
+    ///        follows the grain, and the grain is not negotiable.
     std::vector<Placement> place(const Bin &bin,
                                  const std::vector<Clipper2Lib::Path64> &pieces,
+                                 const std::vector<std::vector<double>> &allowedAngles = {},
                                  bool *abandoned = nullptr) const;
 
     /// Envelope height of a placement result, in the unit of the input polygons
