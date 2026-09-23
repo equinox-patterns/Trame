@@ -37,4 +37,21 @@ struct Placement
     double rotation   = 0;  ///< Rotation applied, in degrees, about the reference point
 };
 
+/// Which wall of the bin a piece is glued to, when its position ACROSS the bin is not the
+/// nesting's to choose.
+///
+/// A piece cut on the fold has to have its fold line exactly on the fabric's fold, and the fold is
+/// one long edge of the strip bin. Nothing is left to decide but how far the piece slides along
+/// that edge — which is a different question from the one the engine answers by default, and the
+/// reason this exists at all: "against the wall" is an equality, and no containment test states one.
+///
+/// **`Free` is the default everywhere**: the print run, both test benches and Rabnest ask for
+/// nothing and see nothing. One wall is built — the left one, which is where a caller that folds
+/// its fabric pins its pieces.
+enum class Anchor : unsigned char
+{
+    Free = 0,
+    LeftWall,
+};
+
 #endif // PLACEMENT_H

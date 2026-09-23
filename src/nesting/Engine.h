@@ -96,9 +96,16 @@ public:
     ///        every caller before this parameter existed got. A non-empty list pins that piece to
     ///        the angles it holds, and the piece is never seen at any other: a piece laid on fabric
     ///        follows the grain, and the grain is not negotiable.
+    /// @param anchors which wall of the bin a piece is glued to, parallel to @p pieces on the same
+    ///        terms — **empty, the default, glues nothing**. A glued piece keeps its rotations and
+    ///        its slide along the wall; what it loses is its position across the bin, which the
+    ///        caller has already decided. It is how a piece cut on the fold is laid: its fold line
+    ///        has to sit exactly on the fabric's fold, and a hair away is a piece cut to the wrong
+    ///        width. @see Anchor
     std::vector<Placement> place(const Bin &bin,
                                  const std::vector<Clipper2Lib::Path64> &pieces,
                                  const std::vector<std::vector<double>> &allowedAngles = {},
+                                 const std::vector<Anchor> &anchors = {},
                                  bool *abandoned = nullptr) const;
 
     /// Envelope height of a placement result, in the unit of the input polygons

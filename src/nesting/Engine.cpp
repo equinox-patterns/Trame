@@ -46,6 +46,7 @@ using NestGeom::translatePaths;
 using NestGeom::rotatePath;
 using NestGeom::negatePath;
 using NestGeom::findBottomLeft;
+using NestGeom::findBottomAtX;
 using NestGeom::nfpOutsideIFP;
 using NestGeom::ensureCCW;
 // Named, and not re-exported by Engine.h: a using-declaration at class scope may only
@@ -125,6 +126,18 @@ double Engine::placeSequential(const Bin &bin,
         int64_t ifpX1 = binW - margin - bboxB.xMax;
         int64_t ifpY0 = margin - bboxB.yMin;
 
+        // **A glued piece has no position across the bin to choose.** `ifpX0` is the origin that
+        // puts the rotated path flush against the inner left edge, and for this piece that is the
+        // only x there is: the wall decides it, and what is left to the search is how far the piece
+        // slides along the wall. It is what a piece cut on the fold needs — its fold line has to
+        // sit ON the fold, and a hair beside it is a piece cut to the wrong width.
+        //
+        // The window the region is built from is left alone: the three tests below still ask
+        // whether a piece fits between the margins, and `ifpX1` is still the right-hand margin it
+        // must clear. Only the POSITION gets read differently — off the wall line, among the
+        // vertices that sit on it. See NestGeom::findBottomAtX for why a band is not the answer.
+        const bool glued = bg.anchor == Anchor::LeftWall;
+
         if (ifpX1 <= ifpX0) {
             // A failure, and it has to LOOK like one. Writing the trial rotation here left
             // the piece indistinguishable from a placed one — x and y keep their default
@@ -189,7 +202,8 @@ double Engine::placeSequential(const Bin &bin,
                            Clipper2Lib::FillRule::NonZero, feasible);
         }
 
-        const Clipper2Lib::Point64 pos = findBottomLeft(feasible);
+        const Clipper2Lib::Point64 pos = glued ? findBottomAtX(feasible, ifpX0)
+                                               : findBottomLeft(feasible);
         if (pos.y >= infY) {
             // The same failure, the same marker — see the note on the other one.
             out[pieceIdx].pieceIndex = pieceIdx;
@@ -338,6 +352,7 @@ Engine::Engine(const Config &cfg) noexcept
 std::vector<Placement> Engine::place(const Bin &bin,
                                      const std::vector<Clipper2Lib::Path64> &pieces,
                                      const std::vector<std::vector<double>> &allowedAngles,
+                                     const std::vector<Anchor> &anchors,
                                      bool *abandoned) const
 {
     if (abandoned != nullptr)
@@ -367,7 +382,7 @@ std::vector<Placement> Engine::place(const Bin &bin,
     const std::vector<Clipper2Lib::Path64> local = NestGeom::normalizeToLocal(pieces);
     const std::vector<std::vector<RotGeom>> rotBank =
         NestGeom::buildRotBank(local, m_config.rotationStep, numRots,
-                               static_cast<int64_t>(m_config.gap * kScale), allowedAngles);
+                               static_cast<int64_t>(m_config.gap * kScale), allowedAngles, anchors);
 
     // The bin's forbidden zones, as engine geometry, built ONCE for the whole
     // run: the annealing below calls placeSequential hundreds of times, and
@@ -412,7 +427,15 @@ std::vector<Placement> Engine::place(const Bin &bin,
     // The adjustment pass — strictly after the search, never inside it. The
     // grid is read here and nowhere else: the annealing above runs exactly as
     // it did before tiling existed, and without a grid this line does nothing.
-    if (m_config.artboardCount > 0 && m_config.artboardHeight > 0.0) {
+    //
+    // ⚠️ And never on a plan that has a piece glued to a wall. That pass translates BLOCKS of
+    // pieces to bring their borders off the frame lines: it moves a piece it did not choose, and a
+    // glued piece that is moved is a piece off the fold — the one thing the caller pinned it for.
+    // Nothing here checks the glued pieces one by one, because there is no version of that pass
+    // that may touch one: a plan glued to a wall is not a plan it may rearrange.
+    const bool anyGlued = std::any_of(anchors.cbegin(), anchors.cend(),
+                                      [](Anchor a) { return a != Anchor::Free; });
+    if (!anyGlued && m_config.artboardCount > 0 && m_config.artboardHeight > 0.0) {
         if (refine(bin, rotBank, best, pieces)) {
             if (abandoned != nullptr)
                 *abandoned = true;

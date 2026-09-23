@@ -37,6 +37,11 @@
 #include <clipper2/clipper.h>
 #include <clipper2/clipper.minkowski.h>
 
+// Le vocabulaire du placement — `Placement`, et `Anchor` qu'une entrée de banque porte. Le noyau
+// géométrique ne connaît ni `Bin` ni `Engine`, mais il sait où va une pièce : c'est le type que
+// `buildRotBank` recopie sur chaque `RotGeom`, et le déclarer ailleurs en ferait un second nom.
+#include "model/Placement.h"
+
 /// Boîte englobante en coordonnées entières Clipper.
 ///
 /// ⚠️ Type GLOBAL, et il l'était déjà dans `Engine.h` avant cette extraction :
@@ -195,6 +200,32 @@ inline Clipper2Lib::Point64 findBottomLeft(const Clipper2Lib::Paths64 &paths)
     return best;
 }
 
+/// Lowest vertex of @p paths lying exactly on the vertical line `x == @p x`.
+///
+/// **The wall query.** A piece glued to the bin's inner left edge has its origin ON that edge and
+/// nothing else to choose, so its position is read among the vertices that sit on the line — never
+/// among the ones beside it. Intersecting the region with a thin band instead was tried and is
+/// WRONG, not merely imprecise: `findBottomLeft` returns a vertex, and on a band `[x, x+ε]` the
+/// lowest vertex is the lowest point of the region anywhere in the band — the wall is often blocked
+/// from the floor up while the band is free higher, so the answer comes back at `x + ε`, a piece
+/// laid off the wall by ε and reported as laid. The exact answer is always a vertex **on the line**:
+/// the region's left edge is the placement window's own left edge, and it survives subtraction
+/// only as an edge whose corners and crossings are all vertices.
+///
+/// Returns `{x, INT64_MAX}` when no vertex lies on the line — the same "nothing here" answer
+/// @ref findBottomLeft gives, so the caller's existing empty test catches it unchanged.
+inline Clipper2Lib::Point64 findBottomAtX(const Clipper2Lib::Paths64 &paths, int64_t x)
+{
+    Clipper2Lib::Point64 best = {x, (std::numeric_limits<int64_t>::max)()};
+    for (const auto &path : paths) {
+        for (const auto &p : path) {
+            if (p.x == x && p.y < best.y)
+                best = p;
+        }
+    }
+    return best;
+}
+
 /// Conservative check: can the NFP of placed piece A (at px,py) possibly
 /// intersect the IFP rectangle [ifpX0,ifpX1]×[ifpY0,∞)?
 inline bool nfpOutsideIFP(const BBox &bboxA, const BBox &bboxB,
@@ -225,6 +256,15 @@ struct RotGeom
     /// those are the piece's own angles, not multiples of the step. Every reader that used to say
     /// `index * rotationStep` reads this instead.
     double angle = 0.0;
+
+    /// The wall this entry is glued to, if any.
+    ///
+    /// Carried on the geometry for the same reason the angle is: it is what the CALLER decided
+    /// about this piece, and a second place that recomputed it could answer differently. It rides
+    /// the bank rather than the piece list so that `placeSequential` — called hundreds of times by
+    /// the annealing, once per order and per rotation — reads it where it already reads everything
+    /// else about the entry.
+    Anchor anchor = Anchor::Free;
 };
 
 /// One RotGeom per (piece, rotation), from contours already normalized to their
@@ -243,10 +283,15 @@ struct RotGeom
 ///        nobody constrained**, and it keeps the whole regular sweep; a non-empty one is a piece
 ///        whose direction is known, tried at those angles and at those only. A shorter vector than
 ///        @p local leaves the pieces it does not reach unconstrained.
+/// @param anchors one value per piece, parallel to @p local, on the same terms: an empty or short
+///        vector leaves the pieces it does not reach glued to nothing. It says nothing about the
+///        angles — a glued piece is still swept by whatever @p allowedAngles gives it, and a
+///        caller that wants one rotation only says so there.
 inline std::vector<std::vector<RotGeom>>
 buildRotBank(const std::vector<Clipper2Lib::Path64> &local,
              double rotationStep, int numRots, int64_t gapRadius,
-             const std::vector<std::vector<double>> &allowedAngles = {})
+             const std::vector<std::vector<double>> &allowedAngles = {},
+             const std::vector<Anchor> &anchors = {})
 {
     const std::size_t N = local.size();
 
@@ -254,10 +299,12 @@ buildRotBank(const std::vector<Clipper2Lib::Path64> &local,
     for (std::size_t i = 0; i < N; ++i) {
         const bool constrained = i < allowedAngles.size() && !allowedAngles[i].empty();
         const int count = constrained ? static_cast<int>(allowedAngles[i].size()) : numRots;
+        const Anchor anchor = i < anchors.size() ? anchors[i] : Anchor::Free;
 
         rotBank[i].reserve(static_cast<std::size_t>(count));
         for (int r = 0; r < count; ++r) {
             RotGeom g;
+            g.anchor = anchor;
             g.angle = constrained ? allowedAngles[i][static_cast<std::size_t>(r)]
                                   : r * rotationStep;
             g.path = rotatePath(local[i], g.angle);
