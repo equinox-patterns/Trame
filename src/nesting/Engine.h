@@ -109,7 +109,8 @@ public:
                                  bool *abandoned = nullptr) const;
 
     /// Envelope height of a placement result, in the unit of the input polygons
-    /// (the bin margin included).
+    /// (the bin's BOTTOM margin included; the top one is already inside the
+    /// placements, since the first piece starts a margin below the edge).
     ///
     /// place() computes this internally to drive the annealing but does not
     /// return it. Every caller that needs the final height — writers, tests,
@@ -124,9 +125,9 @@ public:
     /// The number the host application turns a used height into, written once so that the two
     /// places needing it cannot answer differently: the adjustment pass, which may not cross a row
     /// boundary either way, and the host's own reading of the same formula. Both measure from the
-    /// used height WITH the bin margin already in it — which is what UsedHeight returns — and both
-    /// lengths are in the unit of the input polygons. artboardHeight is in that same unit, as
-    /// Config says.
+    /// used height WITH the bin's bottom margin already in it — which is what UsedHeight returns —
+    /// and both lengths are in the unit of the input polygons. artboardHeight is in that same unit,
+    /// as Config says.
     ///
     /// Note what this is NOT: it is not the cost the annealing minimises. That is the height, and
     /// it has to be — see the note in placeSequential. This counts the rows the host will print,

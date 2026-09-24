@@ -45,13 +45,19 @@ struct Placement
 /// that edge — which is a different question from the one the engine answers by default, and the
 /// reason this exists at all: "against the wall" is an equality, and no containment test states one.
 ///
+/// **Both walls are real, and a caller can need either.** Fabric folded so that its two selvedges
+/// meet inward has a fold on EACH long edge of the stack: a piece cut on the fold is glued to the
+/// wall of its own half, and the two halves are the two walls. The left one is asked for by a
+/// caller whose fold is on the left of its bin; the right one by a caller whose fold is on the
+/// right — the same placement rule, seen from the other side.
+///
 /// **`Free` is the default everywhere**: the print run, both test benches and Rabnest ask for
-/// nothing and see nothing. One wall is built — the left one, which is where a caller that folds
-/// its fabric pins its pieces.
+/// nothing and see nothing.
 enum class Anchor : unsigned char
 {
     Free = 0,
     LeftWall,
+    RightWall,
 };
 
 #endif // PLACEMENT_H

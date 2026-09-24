@@ -46,23 +46,73 @@ public:
         double height = 0.0;
     };
 
+    /// What the bin leaves clear along each of its four edges, in the caller's unit.
+    ///
+    /// **Four numbers rather than one** because a folded fabric has four different ones: the edge
+    /// a piece is cut ON THE FOLD against pays nothing — its fold line has to sit exactly on the
+    /// fold, and a margin would push it off by that much, so the piece comes out too narrow by
+    /// twice as much once the cloth is opened — while a selvedge edge pays.
+    ///
+    /// A bin with one margin for everything — the print run's, Rabnest's, both benches' — has all
+    /// four equal, and therefore behaves **exactly** as it did when there was only one.
+    ///
+    /// ⚠️ The unit is the CALLER's, like @ref Zone and for the same reason.
+    ///
+    /// ⚠️ **This is not a job for @ref Zone**, tempting as it looks: a zone is inflated by the whole
+    /// piece gap before it forbids anything, so a zone saying "keep 20 mm off the edge" would keep
+    /// `20 mm + gap`. Two different rules, two different places.
+    struct Margins
+    {
+        double left{0.0};
+        double top{0.0};
+        double right{0.0};
+        double bottom{0.0};
+
+        /// The same value on all four sides — what `Bin(width, margin)` builds, and all any caller
+        /// but one ever asks for.
+        ///
+        /// Deliberately a named function and not a one-argument constructor: a constructor would
+        /// make `Bin(1400, 5.0, zones)` ambiguous between the two of them.
+        static auto Uniform(double all) noexcept -> Margins
+        {
+            return Margins{all, all, all, all};
+        }
+    };
+
     /// Construct a strip bin with the given width and margin in millimetres.
     /// An optional obstacle rectangle can be placed at the top-left corner
     /// (after margin). Pieces will not be placed on top of it.
     ///
-    /// The obstacle is appended to the zone list, at the corner. The two
-    /// accessors below are kept because hosts report the obstacle's bottom.
+    /// **The same margin on all four sides.** The obstacle is appended to the zone
+    /// list, at the corner. The two accessors below are kept because hosts report
+    /// the obstacle's bottom.
     explicit Bin(double widthMm, double marginMm = 5.0,
                  double obstacleWidthMm = 0.0, double obstacleHeightMm = 0.0);
 
     /// Construct a strip bin whose forbidden zones are given outright.
     Bin(double widthMm, double marginMm, std::vector<Zone> zones);
 
+    /// Construct a strip bin whose four margins are given one by one.
+    ///
+    /// **No corner obstacle here**: a caller that wants one already has it in @p zones — the list
+    /// form is how it asks for it — and the bin that needs four margins is the folded cloth's,
+    /// which never has an obstacle to place.
+    Bin(double widthMm, Margins margins, std::vector<Zone> zones);
+
     /// Strip width in millimetres (total physical width, margins included).
     double widthMm() const noexcept { return m_widthMm; }
 
-    /// Margin inside the bin edges where pieces cannot be placed, in millimetres.
-    double marginMm() const noexcept { return m_marginMm; }
+    /// The margin of a bin built with ONE value — **the same on all four sides**.
+    ///
+    /// A bin built with @ref Margins answers its LEFT margin here. A reader that needs all four
+    /// asks @ref margins instead; this stays for the callers that have only ever wanted the one
+    /// number, and answering it with the left is what keeps them reading exactly what they read
+    /// before.
+    double marginMm() const noexcept { return m_margins.left; }
+
+    /// What the bin leaves clear on each of its four edges. All four are equal on a bin built with
+    /// a single margin.
+    const Margins &margins() const noexcept { return m_margins; }
 
     /// Obstacle rectangle dimensions at the top-left corner, in millimetres.
     ///
@@ -76,7 +126,7 @@ public:
 
 private:
     double m_widthMm;
-    double m_marginMm;
+    Margins m_margins;
     double m_obstacleWidthMm  = 0.0;
     double m_obstacleHeightMm = 0.0;
     std::vector<Zone> m_zones;

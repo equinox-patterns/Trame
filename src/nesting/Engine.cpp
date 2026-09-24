@@ -77,7 +77,12 @@ double Engine::placeSequential(const Bin &bin,
                                int64_t infY) const
 {
     const int64_t binW    = static_cast<int64_t>(bin.widthMm() * kScale);
-    const int64_t margin  = static_cast<int64_t>(bin.marginMm() * kScale);
+    const int64_t marginL = static_cast<int64_t>(bin.margins().left * kScale);
+    const int64_t marginR = static_cast<int64_t>(bin.margins().right * kScale);
+    const int64_t marginT = static_cast<int64_t>(bin.margins().top * kScale);
+    // The bottom margin is not read here and has nothing to read: the strip is open downwards, so
+    // nothing forbids a piece from sitting at the end of the cloth. It is what UsedHeight adds
+    // afterwards — see the note there.
 
     out.clear();
     out.resize(rotBank.size());
@@ -122,21 +127,34 @@ double Engine::placeSequential(const Bin &bin,
         const RotGeom &bg  = rotBank[pieceIdx][rIdx];
         const BBox &bboxB  = bg.bbox;
 
-        int64_t ifpX0 = margin - bboxB.xMin;
-        int64_t ifpX1 = binW - margin - bboxB.xMax;
-        int64_t ifpY0 = margin - bboxB.yMin;
+        int64_t ifpX0 = marginL - bboxB.xMin;
+        int64_t ifpX1 = binW - marginR - bboxB.xMax;
+        int64_t ifpY0 = marginT - bboxB.yMin;
 
         // **A glued piece has no position across the bin to choose.** `ifpX0` is the origin that
-        // puts the rotated path flush against the inner left edge, and for this piece that is the
-        // only x there is: the wall decides it, and what is left to the search is how far the piece
-        // slides along the wall. It is what a piece cut on the fold needs — its fold line has to
-        // sit ON the fold, and a hair beside it is a piece cut to the wrong width.
+        // puts the rotated path flush against the inner left edge and `ifpX1` the one that puts it
+        // flush against the inner right edge — the two walls, each read off the window the piece is
+        // placed in. For a glued piece that is the only x there is: the wall decides it, and what is
+        // left to the search is how far the piece slides along the wall. It is what a piece cut on
+        // the fold needs — its fold line has to sit ON the fold, and a hair beside it is a piece cut
+        // to the wrong width. Both walls matter: fabric folded so its two selvedges meet inward has
+        // a fold on each long edge, so one half of the stack pins to one wall and the other to the
+        // other.
         //
         // The window the region is built from is left alone: the three tests below still ask
-        // whether a piece fits between the margins, and `ifpX1` is still the right-hand margin it
+        // whether a piece fits between the margins, and `ifpX0`/`ifpX1` are still the margins it
         // must clear. Only the POSITION gets read differently — off the wall line, among the
         // vertices that sit on it. See NestGeom::findBottomAtX for why a band is not the answer.
-        const bool glued = bg.anchor == Anchor::LeftWall;
+        //
+        // ⚠️ **What the wall is WORTH, and who answers for it.** `ifpX0` sits `margins.left` from
+        // the bin's edge, and `ifpX1` `margins.right` from it the other way, so a glued piece's fold
+        // line ends up that far from the fold. For a piece cut on the fold there is exactly ONE
+        // right value there, and it is **zero** — the engine knows nothing of folds and cannot
+        // decide this. The caller does, and writes it in one place: `SeatMargins`, in
+        // oexportnesting.cpp.
+        const Anchor anchor = bg.anchor;
+        const bool gluedLeft = anchor == Anchor::LeftWall;
+        const bool gluedRight = anchor == Anchor::RightWall;
 
         if (ifpX1 <= ifpX0) {
             // A failure, and it has to LOOK like one. Writing the trial rotation here left
@@ -202,8 +220,14 @@ double Engine::placeSequential(const Bin &bin,
                            Clipper2Lib::FillRule::NonZero, feasible);
         }
 
-        const Clipper2Lib::Point64 pos = glued ? findBottomAtX(feasible, ifpX0)
-                                               : findBottomLeft(feasible);
+        Clipper2Lib::Point64 pos = {int64_t(0), int64_t(0)};
+        if (gluedLeft) {
+            pos = findBottomAtX(feasible, ifpX0);
+        } else if (gluedRight) {
+            pos = findBottomAtX(feasible, ifpX1);
+        } else {
+            pos = findBottomLeft(feasible);
+        }
         if (pos.y >= infY) {
             // The same failure, the same marker — see the note on the other one.
             out[pieceIdx].pieceIndex = pieceIdx;
@@ -509,6 +533,13 @@ double Engine::UsedHeight(const std::vector<Placement> &placements,
         if (bottom > usedHeight) { usedHeight = bottom; }
     }
 
-    // The top margin is already part of the placement area: the IFP starts at y = margin.
-    return usedHeight + bin.marginMm();
+    // The TOP margin is already part of the placement area — `ifpY0 = margins.top - bbox.yMin`, so
+    // the first piece starts that far from the edge — and what is added here is the BOTTOM one: the
+    // strip runs from the start of the yardage to its end, and the last rectangle keeps its space
+    // there.
+    //
+    // ⚠️ **On a bin with a single margin the bottom equals the top, so this reports exactly what it
+    // reported before there were four.** This line, and not another, is where the non-regression of
+    // every strip run is read.
+    return usedHeight + bin.margins().bottom;
 }

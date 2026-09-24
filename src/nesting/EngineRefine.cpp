@@ -130,11 +130,14 @@ bool Engine::refine(const Bin &bin,
         }
     }
 
-    const int64_t binW   = static_cast<int64_t>(bin.widthMm() * kScale);
-    const int64_t margin = static_cast<int64_t>(bin.marginMm() * kScale);
-    const int64_t gapR   = static_cast<int64_t>(m_config.gap * kScale);
-    const int64_t cellW  = binW / m_config.artboardCount;
-    const int64_t cellH  = static_cast<int64_t>(m_config.artboardHeight * kScale);
+    const int64_t binW    = static_cast<int64_t>(bin.widthMm() * kScale);
+    const int64_t marginL = static_cast<int64_t>(bin.margins().left * kScale);
+    const int64_t marginR = static_cast<int64_t>(bin.margins().right * kScale);
+    const int64_t marginT = static_cast<int64_t>(bin.margins().top * kScale);
+    const int64_t marginB = static_cast<int64_t>(bin.margins().bottom * kScale);
+    const int64_t gapR    = static_cast<int64_t>(m_config.gap * kScale);
+    const int64_t cellW   = binW / m_config.artboardCount;
+    const int64_t cellH   = static_cast<int64_t>(m_config.artboardHeight * kScale);
 
     if (cellW <= 0 || cellH <= 0)
     {
@@ -300,11 +303,11 @@ bool Engine::refine(const Bin &bin,
         {
             const BBox &g = rotBank[k][rIdx[k]].bbox;
 
-            if (out[k].x + g.xMin < margin || out[k].x + g.xMax > binW - margin)
+            if (out[k].x + g.xMin < marginL || out[k].x + g.xMax > binW - marginR)
             {
                 return {};
             }
-            if (out[k].y + g.yMin < margin)
+            if (out[k].y + g.yMin < marginT)
             {
                 return {};
             }
@@ -357,7 +360,10 @@ bool Engine::refine(const Bin &bin,
         {
             newUsed = std::max(newUsed, out[j].y + rotBank[j][rIdx[j]].bbox.yMax);
         }
-        newUsed += margin;
+        // The BOTTOM margin, the same one UsedHeight adds: the host recomputes the row count from
+        // the height this pass leaves behind, and a height measured with a different margin than
+        // the one it will be reported with is a row counted twice or lost.
+        newUsed += marginB;
 
         if (newUsed > (envelope - guard) || newUsed <= (envelope - cellH))
         {

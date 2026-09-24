@@ -310,6 +310,10 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     if (N == 0)
         return {};
 
+    // ⚠️ **This engine takes a bin with ONE margin for all four sides** — the print run's, never
+    // the folded cloth's (the arbitration refuses those, see oexportnesting.cpp): the four sides of
+    // its closed frame are the same number, and `marginMm()` says it. A bin built with four
+    // different margins would silently lose three of them here.
     const int64_t binW   = static_cast<int64_t>(bin.widthMm() * kScale);
     const int64_t margin = static_cast<int64_t>(bin.marginMm() * kScale);
     const int64_t gapR   = static_cast<int64_t>(m_spec.gap * kScale);
