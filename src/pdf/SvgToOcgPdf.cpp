@@ -649,6 +649,19 @@ QByteArray SvgToOcgPdf::buildWholeSvg(const QDomDocument &origDoc, const PageInf
     // carries nothing but plain SVG.
     for (QDomElement child = origDoc.documentElement().firstChildElement(); !child.isNull();
          child = child.nextSiblingElement()) {
+        // ⚠️ **LA MÉTADONNÉE N'EST PAS UN DESSIN.** Le SVG le dit : `<metadata>` porte ce que le
+        // fichier transporte, jamais une forme. `QSvgRenderer`, lui, ne le sait pas — il dessine les
+        // enfants de tout élément qu'il ne connaît pas. Le payload d'Ostara vit précisément là, avec
+        // les décors de toutes les pièces (traits de pli, cartouches, droit-fils) : rendus, ils
+        // tombaient au milieu du plan, à des places qui n'appartiennent à aucune feuille. Constaté
+        // sur un patron réel : sans les métadonnées le PDF est propre, avec elles il se remplit de
+        // traits de pli et de cartouches flottants. On les écarte donc, avec les deux autres
+        // éléments qui ne se dessinent pas non plus.
+        const QString tag = child.tagName();
+        if (tag == QLatin1String("metadata") || tag == QLatin1String("title")
+            || tag == QLatin1String("desc")) {
+            continue;
+        }
         svgRoot.appendChild(underlayDoc.importNode(child, true));
     }
     removeTextElements(svgRoot);

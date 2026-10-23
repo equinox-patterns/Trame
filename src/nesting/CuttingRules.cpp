@@ -147,9 +147,16 @@ auto CuttingRules::FoldAngle(const std::vector<std::pair<double, double>> &conto
         }
     }
 
-    // Un dixième de millième de pixel. La rotation est une transformation de coordonnées, et deux
-    // points que le calcul sépare de ça ne sont pas séparés : c'est du bruit, pas une pente.
-    constexpr double kTolerance = 1e-4;
+    // ⚠️ **Un vingtième de pixel, et pas un dix-millième.** Ce test demande si le pli est le BORD
+    // extrême de la pièce : il compare tous les sommets à l'axe, et un seul sommet du mauvais côté
+    // suffit à refuser la pièce. À 1e-4 px, il refusait « Devant x1 pli » d'un patron réel pour
+    // 0,013 px — trois millièmes de millimètre, l'écart de l'algorithme de valeur de couture à un
+    // coin, invisible au dessin (un trait fait 0,2 px) et sans effet sur une coupe.
+    //
+    // 0,05 px = 0,013 mm : un peu au-dessus du bruit de la géométrie, et deux cent cinquante fois
+    // plus petit qu'un trait. Une pièce qui TRAVERSE vraiment le pli le fait de millimètres, jamais
+    // de ça — le garde-fou ne perd donc rien de ce qu'il protège.
+    constexpr double kTolerance = 5e-2;
 
     const auto [first, second] = Turn(fold, chosen);
     const double dx = second.x - first.x;
