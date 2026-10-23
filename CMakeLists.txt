@@ -33,30 +33,40 @@ find_package(ZLIB REQUIRED)
 set(CMAKE_AUTOMOC OFF)
 
 set(TRAME_SOURCES
+    src/decor/MarkPainter.cpp
     src/io/NestedSvgWriter.cpp
+    src/io/SvgOutliner.cpp
+    src/io/SvgTextFace.cpp
     src/io/SvgReader.cpp
     src/nesting/Bin.cpp
+    src/nesting/CuttingRules.cpp
     src/nesting/Engine.cpp
     src/nesting/EngineRefine.cpp
     src/nesting/Footprint.cpp
     src/nesting/TiledEngine.cpp
+    src/pdf/PdfPayload.cpp
     src/pdf/SvgToOcgPdf.cpp
 )
 
 set(TRAME_HEADERS
+    src/decor/MarkPainter.h
     src/model/Piece.h
     src/model/Placement.h
     src/model/GradedSize.h
     src/io/GradedSvgContract.h
     src/io/NestedSvgWriter.h
+    src/io/SvgOutliner.h
+    src/io/SvgTextFace.h
     src/io/SvgReader.h
     src/nesting/Bin.h
+    src/nesting/CuttingRules.h
     src/nesting/Engine.h
     src/nesting/Footprint.h
     src/nesting/NestGeom.h
     src/nesting/TiledEngine.h
     src/nesting/ZoneGeom.h
     src/pdf/PdfBuilder.h
+    src/pdf/PdfPayload.h
     src/pdf/SvgToOcgPdf.h
 )
 
@@ -97,6 +107,11 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets SvgWidgets)
 # étaient compilées deux fois) : il prend les objets de libTrame.a.
 add_executable(svg2ocgpdf tools/svg2ocgpdf.cpp)
 target_link_libraries(svg2ocgpdf PRIVATE Trame Qt6::Widgets)
+
+# pdfpayload : le bout récepteur du PDF hybride, exercable hors des deux applications.
+# Il ne sert qu'à prouver l'aller-retour — écrire une charge utile, la relire à l'identique.
+add_executable(pdfpayload tools/pdfpayload.cpp)
+target_link_libraries(pdfpayload PRIVATE Trame)
 
 add_executable(svg2pdf tests/svg2pdf.cpp)
 target_link_libraries(svg2pdf PRIVATE

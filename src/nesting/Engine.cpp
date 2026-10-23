@@ -127,8 +127,34 @@ double Engine::placeSequential(const Bin &bin,
         const RotGeom &bg  = rotBank[pieceIdx][rIdx];
         const BBox &bboxB  = bg.bbox;
 
-        int64_t ifpX0 = marginL - bboxB.xMin;
-        int64_t ifpX1 = binW - marginR - bboxB.xMax;
+        // ⚠️ **La marge du côté du pli est PAR PIÈCE, et elle ne rétrécit jamais le bac.**
+        //
+        // Sur tissu plié, le pli court sur un grand bord et l'appelant demande une marge de ZÉRO de
+        // ce côté — une pièce coupée au pli doit avoir son pli exactement SUR le pli du tissu. Mais une
+        // marge de bac vaut pour toutes les pièces : ce zéro ouvrait le bord plié à TOUT LE MONDE, et
+        // l'écart saisi dans le champ était ignoré de ce côté. C'est le défaut.
+        //
+        // Le zéro appartient donc aux pièces ANCRÉES à cette paroi, et à elles seules. Les autres
+        // respectent l'écart — mais **en portant la contrainte sur leur propre position**, jamais en
+        // rétrécissant la zone : rétrécir le bac retirait un centimètre à toutes les pièces alors que
+        // la laize pliée n'en fait déjà que la moitié, et le plan entier devenait impossible.
+        //
+        // Et l'écart est TENU, sans condition : la hauteur du bac est libre, donc manquer de place
+        // n'est jamais une raison de céder sur la largeur — le plan descend, et voilà tout. Céder sur
+        // l'écart serait décider à la place de l'utilisatrice d'une chose qu'elle a tapée.
+        //
+        // Le côté plié est celui où les marges diffèrent : l'appelant y écrit 0 et l'écart de l'autre.
+        // Des marges égales — tissu déplié, ou écart nul partout — n'exemptent rien.
+        const int64_t edgePx = std::max(marginL, marginR);
+        const bool foldsOnLeft = marginL < marginR;
+        const bool foldsOnRight = marginR < marginL;
+        const int64_t wantedL =
+            (foldsOnLeft && bg.anchor != Anchor::LeftWall) ? edgePx : marginL;
+        const int64_t wantedR =
+            (foldsOnRight && bg.anchor != Anchor::RightWall) ? edgePx : marginR;
+
+        int64_t ifpX0 = wantedL - bboxB.xMin;
+        int64_t ifpX1 = binW - wantedR - bboxB.xMax;
         int64_t ifpY0 = marginT - bboxB.yMin;
 
         // **A glued piece has no position across the bin to choose.** `ifpX0` is the origin that

@@ -14,6 +14,9 @@
 
 #include "SvgToOcgPdf.h"
 #include "PdfBuilder.h"
+#include "PdfPayload.h"
+#include "io/SvgOutliner.h"
+#include "io/SvgTextFace.h"
 
 #include <QBuffer>
 #include <QDebug>
@@ -235,12 +238,62 @@ static bool parseColor(const QString &s, double &r, double &g, double &b)
     return false;
 }
 
+namespace
+{
+/// The payload the caller asked to carry, or nothing when they asked for none.
+///
+/// A caller who NAMES a payload and gets a closed PDF has been lied to silently, and the
+/// file would look perfectly normal: printable, and impossible to reopen. So a payload that
+/// cannot be read fails the export rather than being quietly left out.
+bool ReadPayload(const QString &path, QByteArray &into)
+{
+    if (path.isEmpty())
+        return true;
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        qWarning() << "SvgToOcgPdf: cannot open the payload" << path;
+        return false;
+    }
+
+    into = file.readAll();
+    file.close();
+
+    if (into.isEmpty()) {
+        qWarning() << "SvgToOcgPdf: the payload is empty" << path;
+        return false;
+    }
+
+    // **The payload leaves with its text as outlines.** A client's machine has none of the
+    // fonts the plan was drawn with — the pattern maker's Jost and Yustine Signature — and a
+    // document that needs them is a document that looks different on her screen than on this
+    // one. The PDF already writes its words as paths; the payload has to answer the same way,
+    // because it is what the client reopens.
+    QStringList missingFonts;
+    into = SvgOutliner::outline(into, &missingFonts);
+    if (!missingFonts.isEmpty()) {
+        // Not fatal, and deliberately: a text whose face is absent is left as text rather than
+        // outlined with a substitute — a wrong outline is a drawing that looks right.
+        qWarning() << "SvgToOcgPdf: fonts missing on this machine, text left as text:"
+                   << missingFonts.join(QStringLiteral(", "));
+    }
+
+    return true;
+}
+}  // namespace
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
                           const DocumentInfo &info, const QString &underlaySvgPath,
-                          bool mepIsLayer)
+                          bool mepIsLayer, const QString &payloadPath)
 {
+    // Read before rendering: a payload that cannot be read fails the export, and failing
+    // after a full render spends the most expensive part of the job to learn nothing.
+    QByteArray payload;
+    if (!ReadPayload(payloadPath, payload))
+        return false;
+
     // One page, and the document is that page: the rectangle covers everything the SVG
     // draws. This is what the svg2ocgpdf tool asks for, and it is the shape a single-size
     // run takes — a document with nothing to cut up is a document with one sheet.
@@ -251,13 +304,15 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QString &pdfPath,
     const QRectF whole(0.0, 0.0, doc.page.sizeMm.width() * kPixelsPerMm,
                        doc.page.sizeMm.height() * kPixelsPerMm);
 
-    return buildOcgPdf(pdfPath, doc, QVector<QRectF>{whole}, info, mepIsLayer);
+    return buildOcgPdf(pdfPath, doc, QVector<QRectF>{whole}, info, mepIsLayer, QRectF(),
+                       payload);
 }
 
 bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
                           const QString &pdfPath, const DocumentInfo &info,
                           const QString &underlaySvgPath, bool mepIsLayer,
-                          const QString &coverSvgPath, const QRectF &coverSheet)
+                          const QString &coverSvgPath, const QRectF &coverSheet,
+                          const QString &payloadPath)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: no page to write";
@@ -274,6 +329,11 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         }
     }
 
+    // Read before rendering, for the reason given in the single-page overload.
+    QByteArray payload;
+    if (!ReadPayload(payloadPath, payload))
+        return false;
+
     const SvgContent doc = readSvg(svgPath, underlaySvgPath, coverSvgPath);
     if (!doc.ok) {
         // An unreadable document is not a plan with one sheet missing: it is every sheet
@@ -283,7 +343,7 @@ bool SvgToOcgPdf::convert(const QString &svgPath, const QVector<QRectF> &pages,
         return false;
     }
 
-    return buildOcgPdf(pdfPath, doc, pages, info, mepIsLayer, coverSheet);
+    return buildOcgPdf(pdfPath, doc, pages, info, mepIsLayer, coverSheet, payload);
 }
 
 namespace
@@ -1168,45 +1228,13 @@ QByteArray SvgToOcgPdf::emitMepTextAsPdfOps(const QDomElement &root, const PageI
             const QString text = el.text().trimmed();
             if (text.isEmpty()) return;
 
-            const QString fontFamily = el.attribute(QStringLiteral("font-family"),
-                                                     QStringLiteral("Jost"));
-            const double fontSize = el.attribute(QStringLiteral("font-size"),
-                                                  QStringLiteral("12")).toDouble();
-            const QString fontWeight = el.attribute(QStringLiteral("font-weight"),
-                                                     QStringLiteral("400"));
             QString fillColor = el.attribute(QStringLiteral("fill"),
                                               QStringLiteral("black"));
 
-            // Build QFont
-            QFont font(fontFamily);
-            font.setPixelSize(static_cast<int>(std::round(fontSize)));
-
-            const QString fw = fontWeight.toLower();
-            if (fw == QStringLiteral("bold") || fw == QStringLiteral("700")
-                || fw == QStringLiteral("800") || fw == QStringLiteral("900")) {
-                font.setBold(true);
-            } else if (fw == QStringLiteral("thin") || fw == QStringLiteral("100")) {
-                font.setWeight(QFont::Thin);
-            } else if (fw == QStringLiteral("light") || fw == QStringLiteral("300")) {
-                font.setWeight(QFont::Light);
-            } else if (fw == QStringLiteral("medium") || fw == QStringLiteral("500")) {
-                font.setWeight(QFont::Medium);
-            } else {
-                bool ok;
-                const int num = fontWeight.toInt(&ok);
-                if (ok) font.setWeight(static_cast<QFont::Weight>(num));
-            }
-            // **The face the document names, when it names one.** Ostara writes the style name of
-            // the face it drew with — « SemiBold », « Book », whatever that family's designer
-            // called it — because a weight NUMBER names no face: the same 300 is « Light » in one
-            // family and « ExtraLight » in the next, and asking for 900 draws « ExtraBold ».
-            // Measured on the fonts installed here. Carried by name, the page keeps the very face
-            // the application used, whatever font the user has.
-            //
-            // A document that names none — every file written before this — keeps the weight it
-            // declares, and the style name is cleared so that Qt does not resolve against a name
-            // the drawing never carried.
-            font.setStyleName(el.attribute(QStringLiteral("ostara:font-face")));
+            // The face, read by the one function that reads it — the SVG a PDF carries is
+            // outlined with the same call, and two answers here would mean a plan whose
+            // cartouche is a little bolder than its own source.
+            const QFont font = SvgTextFace::fontOf(el);
 
             // Generate text outline path
             QPainterPath textPath;
@@ -1418,7 +1446,8 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                                const QVector<QRectF> &pages,
                                const DocumentInfo    &info,
                                bool                   mepIsLayer,
-                               const QRectF          &coverSheet)
+                               const QRectF          &coverSheet,
+                               const QByteArray      &payload)
 {
     if (pages.isEmpty()) {
         qWarning() << "SvgToOcgPdf: nothing to write";
@@ -1449,6 +1478,15 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
     const int infoObj = pdf.alloc();
     pdf.infoObj = infoObj;
     pdf.add(infoObj, BuildInfoObject(info));
+
+    // The payload, when the caller named one. Written once and named by every page, for the
+    // same reason the layers are: it describes the DOCUMENT, not the sheet it happens to be
+    // read from — and a reader that finds it on the page it is looking at has no need to
+    // know which sheet that was.
+    //
+    // Zero means no payload, which is a closed PDF: it prints, and nothing reopens it.
+    const int payloadObj = PdfPayload::write(pdf, payload);
+    const QByteArray pieceInfo = PdfPayload::pageEntry(payloadObj);
 
     // The layer set belongs to the DOCUMENT, and there is now only one document: every
     // page draws the same layers and differs only in which part of the plan it shows. One
@@ -1913,7 +1951,9 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                 "%7"
                 "      >>\n"
                 "   >>\n"
-                "   /Group << /Type /Group /S /Transparency >> >>\n"
+                "   /Group << /Type /Group /S /Transparency >>\n"
+                "%8"
+                ">>\n"
             ).arg(pagesObj)
              .arg(pageWidthPt, 0, 'f', 6)
              .arg(pageHeightPt, 0, 'f', 6)
@@ -1921,6 +1961,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
              .arg(QString::fromUtf8(extGStates))
              .arg(QString::fromUtf8(xobjects))
              .arg(QString::fromUtf8(propsDict))
+             .arg(QString::fromUtf8(pieceInfo))
              .toUtf8());
 
         pageObjs.append(pageObj);

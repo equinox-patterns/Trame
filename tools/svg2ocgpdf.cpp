@@ -34,12 +34,29 @@ int main(int argc, char *argv[])
     const int underlayAt = args.indexOf(QStringLiteral("--underlay"));
     if (underlayAt >= 0) {
         if (underlayAt + 1 >= args.size()) {
-            qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]";
+            qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]"
+                          " [--payload <file>] [--no-layout-layer]";
             return 1;
         }
         underlayPath = args.at(underlayAt + 1);
         args.removeAt(underlayAt + 1);
         args.removeAt(underlayAt);
+    }
+
+    // The payload: a document carried inside the PDF, unread by this tool and unshown by
+    // any reader — what Rabnest relit. Optional, and named for the same reason as the
+    // underlay: an existing command line keeps its meaning. Without it the PDF is closed.
+    QString payloadPath;
+    const int payloadAt = args.indexOf(QStringLiteral("--payload"));
+    if (payloadAt >= 0) {
+        if (payloadAt + 1 >= args.size()) {
+            qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]"
+                          " [--payload <file>] [--no-layout-layer]";
+            return 1;
+        }
+        payloadPath = args.at(payloadAt + 1);
+        args.removeAt(payloadAt + 1);
+        args.removeAt(payloadAt);
     }
 
     // Whether the layout stays one of the reader's layers. Default yes, which is what this
@@ -56,7 +73,7 @@ int main(int argc, char *argv[])
 
     if (args.isEmpty()) {
         qWarning() << "Usage: svg2ocgpdf <file.svg> [output.pdf] [--underlay <file.svg>]"
-                      " [--no-layout-layer]";
+                      " [--payload <file>] [--no-layout-layer]";
         return 1;
     }
 
@@ -72,7 +89,7 @@ int main(int argc, char *argv[])
     }
 
     SvgToOcgPdf converter;
-    if (!converter.convert(svgPath, pdfPath, {}, underlayPath, layoutLayer)) {
+    if (!converter.convert(svgPath, pdfPath, {}, underlayPath, layoutLayer, payloadPath)) {
         qWarning() << "Conversion failed";
         return 1;
     }

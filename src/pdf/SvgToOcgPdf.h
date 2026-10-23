@@ -72,8 +72,18 @@ public:
         QString producer;  ///< the tool that wrote the file. Empty: this module names itself.
     };
 
+    /// @param payloadPath  A document to carry ALONGSIDE the pages, unread and unreported —
+    ///                 the payload Rabnest relit. Empty — the default — is the closed export:
+    ///                 a PDF that prints and that nothing else can reopen.
+    ///
+    ///                 It goes in under /PieceInfo, the standard place for service data, and
+    ///                 never as an embedded file: an entry in the reader's attachment panel
+    ///                 is a paperclip, and a paperclip is a click a client should never be
+    ///                 offered. What the file contains is not this module's business — it is
+    ///                 written byte for byte, compressed, and read back by the same contract.
     bool convert(const QString &svgPath, const QString &pdfPath, const DocumentInfo &info = {},
-                 const QString &underlaySvgPath = QString(), bool mepIsLayer = true);
+                 const QString &underlaySvgPath = QString(), bool mepIsLayer = true,
+                 const QString &payloadPath = QString());
 
     /// @brief Write @p svgPath as ONE PDF, one page per rectangle in @p pages.
     ///
@@ -153,7 +163,8 @@ public:
                  const QString     &underlaySvgPath = QString(),
                  bool               mepIsLayer = true,
                  const QString     &coverSvgPath = QString(),
-                 const QRectF      &coverSheet = QRectF());
+                 const QRectF      &coverSheet = QRectF(),
+                 const QString     &payloadPath = QString());
 
 private:
     struct PageInfo
@@ -320,7 +331,8 @@ private:
                                     const QVector<QRectF> &pages,
                                     const DocumentInfo    &info,
                                     bool                   mepIsLayer,
-                                    const QRectF          &coverSheet = QRectF());
+                                    const QRectF          &coverSheet = QRectF(),
+                                    const QByteArray      &payload = QByteArray());
 };
 
 #endif // SVGTOOCGPDF_H
