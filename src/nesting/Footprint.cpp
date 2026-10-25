@@ -35,9 +35,14 @@ Result compute(const QVector<SizeLayer> &layers)
             // unique group names, and two groups called the same used to be unioned
             // into one footprint. groupKey is what a caller that has a stable id
             // passes; the name stays the display name.
-            const QString key = piece.groupName.isEmpty()
-                ? piece.name
-                : (piece.groupKey.isEmpty() ? piece.groupName : piece.groupKey);
+            // ⚠️ **La clé de la pièce d'abord, son nom seulement à défaut.** `groupKey` est ce que
+            // l'appelant qui a une identité stable passe — et une pièce hors groupe en a une aussi
+            // (`p<id>` pour un projecteur). L'ancienne lecture ne la regardait que pour un membre de
+            // groupe : la clé devenait alors le nom, et un lecteur qui appariait sur la clé de la
+            // pièce ne retrouvait plus rien.
+            const QString key = !piece.groupKey.isEmpty()
+                ? piece.groupKey
+                : (piece.groupName.isEmpty() ? piece.name : piece.groupName);
 
             Clipper2Lib::Path64 c = piece.contour();
             if (c.empty())

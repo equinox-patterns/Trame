@@ -15,6 +15,7 @@
 #include "SvgToOcgPdf.h"
 #include "PdfBuilder.h"
 #include "PdfPayload.h"
+#include "io/GradedSvgContract.h"
 #include "io/SvgOutliner.h"
 #include "io/SvgTextFace.h"
 
@@ -474,7 +475,8 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
             textStream = emitMepTextAsPdfOps(layer.element, result.page, result.alphaStates);
         }
 
-        result.layers.append({layer.name, layer.displayName, layer.isMep, stream, textStream});
+        result.layers.append(
+            {layer.name, layer.displayName, layer.isMep, layer.role, stream, textStream});
     }
 
     if (result.layers.isEmpty()) {
@@ -512,12 +514,26 @@ QVector<SvgToOcgPdf::LayerEntry> SvgToOcgPdf::findLayers(const QDomDocument &doc
         // exists for that, and a layer renamed in her own words is still the decor.
         const bool isMep = el.attribute(QStringLiteral("ostara:layout")) == QStringLiteral("yes");
 
+        // ── Et le troisième rôle : ce qui n'est ni une taille ni le décor ───────────────────────
+        //
+        // Un fond plein page et des grilles de calibration ne sont pas des tailles : sans ce
+        // marqueur ils entreraient dans le panneau du lecteur comme des tailles de plus, Rabnest
+        // les nidifierait comme telles, et l'ordre de peinture les mettrait AU-DESSUS des pièces —
+        // un aplat magenta cacherait le plan. Le rôle est donc lu ici, une fois, et il décide de
+        // tout ce qui suit. Absent, il ne dit rien : le calque est une taille, comme avant.
         LayerEntry entry;
+        const QString roleAttr = el.attribute(QLatin1String(kGradedRoleAttr));
         // The id addresses the layer inside the PDF, so it has to be a name whatever the
         // writer gave us.
         entry.name = id.isEmpty() ? QStringLiteral("layer_%1").arg(result.size()) : id;
         entry.displayName = displayNameOf(el);
         entry.isMep = isMep;
+        entry.role = isMep ? Role::Decor
+                           : (roleAttr == QLatin1String(kGradedRoleBackground)
+                                  ? Role::Background
+                                  : (roleAttr == QLatin1String(kGradedRoleCalibration)
+                                         ? Role::Calibration
+                                         : Role::Size));
         entry.element = el;
 
         result.append(entry);
@@ -1510,35 +1526,63 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
 
     // Separate the size layers from the decor, and tell a layered document from a plain
     // one: optional content only means something when there is something to switch.
+    QVector<const LayerContent *> backgroundLayers;
+    QVector<const LayerContent *> calibrationLayers;
     QVector<const LayerContent *> sizeLayers;
     const LayerContent *mepLayer = nullptr;
     for (const auto &lc : doc.layers) {
         if (lc.plain)
             continue;
-        if (lc.isMep)
+        switch (lc.role) {
+        case Role::Decor:
             mepLayer = &lc;
-        else
+            break;
+        case Role::Background:
+            backgroundLayers.append(&lc);
+            break;
+        case Role::Calibration:
+            calibrationLayers.append(&lc);
+            break;
+        case Role::Size:
+        default:
             sizeLayers.append(&lc);
+            break;
+        }
     }
 
-    // Painting order, bottom first — the sizes, then the decor over them. It is the order
-    // the forms are written in, and the order every page invokes them in.
+    // Ce qui se dessine, dans l'ordre où le SVG l'écrit : le fond, les grilles, les tailles, puis
+    // le décor par-dessus. **Les grilles SOUS les pièces** — un rayon traverse un contour, pas un
+    // aplat : dessous la grille se lit à travers le plan, dessus elle le cacherait.
     QVector<const LayerContent *> drawing;
     if (plain) {
         if (!doc.layers.isEmpty())
             drawing.append(&doc.layers.first());
     } else {
-        drawing = sizeLayers;
+        drawing = backgroundLayers;
+        drawing += calibrationLayers;
+        drawing += sizeLayers;
         if (mepLayer != nullptr)
             drawing.append(mepLayer);
     }
 
-    // OCG objects — one per size. The name is the one the user typed; the id is what
-    // the PDF addresses the layer by, and it is the id that goes in /Properties.
+    // **Les calques que le lecteur peut éteindre**, dans le même ordre : le décor n'en est pas un
+    // ici (son objet a son propre chemin, parce qu'il n'est pas toujours une couche du panneau).
+    QVector<const LayerContent *> switchable;
+    switchable.reserve(drawing.size());
+    for (const LayerContent *layer : drawing) {
+        if (!layer->isMep)
+            switchable.append(layer);
+    }
+
+    // OCG objects — one per layer that the reader may switch. The name is the one the user typed;
+    // the id is what the PDF addresses the layer by, and it is the id that goes in /Properties.
+    //
+    // ⚠️ La liste est celle de la PEINTURE, fond et grilles compris : ce sont eux que le rôle a
+    // sortis des tailles, pas de l'index des calques.
     QVector<int> ocgObjs;
     if (withOcg) {
-        ocgObjs.reserve(sizeLayers.size());
-        for (const auto *sz : sizeLayers) {
+        ocgObjs.reserve(switchable.size());
+        for (const auto *sz : switchable) {
             QByteArray body = "<< /Type /OCG /Name " + pdfTextString(sz->displayName) + " >>\n";
             const int objNum = pdf.alloc();
             ocgObjs.append(objNum);
@@ -1598,9 +1642,9 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                              .arg(mepOcgObj).toUtf8());
     }
     if (withOcg) {
-        for (int i = 0; i < sizeLayers.size(); ++i) {
+        for (int i = 0; i < switchable.size(); ++i) {
             propsDict.append(QStringLiteral("      /%1 %2 0 R\n")
-                                 .arg(sizeLayers[i]->name)
+                                 .arg(switchable[i]->name)
                                  .arg(ocgObjs[i]).toUtf8());
         }
     }
@@ -2060,7 +2104,10 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                  << (mepOcg ? "marked with the decor layer" : "in no layer group");
     }
     if (withOcg) {
-        qDebug() << "  OCG layers:" << sizeLayers.size()
+        // Les calques du panneau, **tous** : les tailles, le fond et les grilles de calibration sont
+        // des calques comme les autres depuis que le rôle existe — n'en compter que les tailles
+        // annoncerait deux calques à un fichier qui en a six.
+        qDebug() << "  OCG layers:" << switchable.size()
                    << "+ decor:" << (mepOcg ? 1 : 0);
     } else {
         qDebug() << "  Flat document: no optional content";

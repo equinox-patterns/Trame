@@ -173,11 +173,28 @@ private:
         QRectF viewBox;
     };
 
+    /// @brief What a layer IS on the page — the third, fourth and fifth thing a layered
+    ///        document can hold besides a size and the decor.
+    ///
+    /// ⚠️ **The painting order follows it, and the reader's panel too.** A background goes
+    /// under everything, calibration grids under the pieces (the plan is drawn in strokes, so
+    /// a grid below it reads through it, where a grid above it would hide it), and the decor
+    /// stays on top. Before this existed the split was binary and "not the decor" meant "a
+    /// size" — see OExportInk in Ostara and the projector's overlays.
+    enum class Role
+    {
+        Size,        ///< une taille du patron — le cas de tous les fichiers d'avant
+        Decor,       ///< `ostara:layout="yes"` : le cartouche, les annotations, la mise en page
+        Background,  ///< un aplat plein page, sous tout
+        Calibration, ///< une grille de calibration, sous les pièces
+    };
+
     struct LayerEntry
     {
         QString    name;        // PDF key, from the id: "Size_46", "Layout". Has to be a name.
         QString    displayName; // what the reader sees: inkscape:label, else <title>, else the id
         bool       isMep;
+        Role       role = Role::Size;
         QDomElement element;    // the <g> element
     };
 
@@ -186,6 +203,7 @@ private:
         QString    name;
         QString    displayName;
         bool       isMep;
+        Role       role = Role::Size;
         QByteArray stream;        // decompressed PDF content from QSvgRenderer
         QByteArray textStream;    // text operators (MEP only), separate CTM scope
         bool       plain = false; // the whole document: no layer, so no optional content

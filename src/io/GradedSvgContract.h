@@ -29,4 +29,21 @@
 static constexpr char kGradedLayoutLayerAttr[] = "ostara:layout";
 static constexpr char kGradedLayoutLayerMarker[] = "yes";
 
+/**
+ * @brief Role marker: what a layer IS, when it is neither a size nor the decor.
+ *
+ * Until it existed, a layered document only knew two roles — `ostara:layout="yes"` for the
+ * decor, and "everything else is a size". The projector needs three more things on the page
+ * that are not sizes: a full-page background and two calibration grids. Without a role they
+ * would become sizes: listed in the reader's panel as sizes, re-nested by Rabnest as sizes,
+ * and painted above the pieces instead of underneath — a magenta sheet would hide the plan.
+ *
+ * The values are the two roles the writer emits today. A layer that carries neither marker
+ * and no `ostara:layout` is a size, exactly as before: the attribute is optional, and an
+ * older file keeps its old meaning.
+ */
+static constexpr char kGradedRoleAttr[] = "ostara:role";
+static constexpr char kGradedRoleBackground[] = "background";
+static constexpr char kGradedRoleCalibration[] = "calibration";
+
 #endif // GRADEDSVGCONTRACT_H
