@@ -38,6 +38,7 @@ set(TRAME_SOURCES
     src/io/SvgOutliner.cpp
     src/io/SvgTextFace.cpp
     src/io/SvgReader.cpp
+    src/io/GradedOverlays.cpp
     src/nesting/Bin.cpp
     src/nesting/CuttingRules.cpp
     src/nesting/Engine.cpp
@@ -54,6 +55,7 @@ set(TRAME_HEADERS
     src/model/Placement.h
     src/model/GradedSize.h
     src/io/GradedSvgContract.h
+    src/io/GradedOverlays.h
     src/io/NestedSvgWriter.h
     src/io/SvgOutliner.h
     src/io/SvgTextFace.h
