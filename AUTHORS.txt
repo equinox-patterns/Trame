@@ -1,0 +1,29 @@
+This file lists the people who have contributed to the Trame project.
+
+================================================================================
+TRAME
+================================================================================
+
+Author and maintainer:
+	Sophie Denys <contact@sophiedenys.com>
+		* Design.
+		* Development.
+
+Trame takes a pattern's pieces and decides where they go on a length of fabric,
+then writes the plan.
+
+Trame is licensed under the GNU General Public License, version 3 or later —
+see LICENSE. It is used by Ostara and Rabnest, both published under the same
+licence.
+
+================================================================================
+COMPONENTS
+================================================================================
+
+	Clipper2 — Angus Johnson and contributors
+		Boost Software License 1.0.
+		Vendored in `third_party/clipper2`, unmodified. The library's own
+		notices are kept in its files.
+
+	Qt — The Qt Company
+		LGPLv3, linked dynamically.
