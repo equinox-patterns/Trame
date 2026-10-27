@@ -63,6 +63,16 @@ namespace NestGeom {
 /// ce chiffre ne dit rien de l'unité.
 inline constexpr double kScale = 1e6;
 
+/// Tolérance de simplification du contour donné au NFP, en unités mises à l'échelle — 0,5 px.
+///
+/// **Le NFP n'a pas besoin du contour exact** : c'est un test de collision, et il gonfle déjà les
+/// pièces du jeu entier pour les tenir à distance. Une somme de Minkowski coûte quadratiquement en
+/// sommets (mesuré : 73 ms à 90 sommets, 2 min 25 sur un run d'impression réel) ; à 0,5 px de
+/// fidélité le plan est identique au centième de millimètre et le run trois fois plus court.
+///
+/// ⚠️ Seul `aref` est simplifié. `path` reste exact : dessin, PDF et payload ne bougent pas.
+inline constexpr double kNfpSimplifyEpsilon = 0.5 * kScale;
+
 // ── The shape of the NFP cache ──────────────────────────────────────────────
 //
 // Moved here from `Engine`, where it was public and reached into by the Tiled
@@ -318,6 +328,32 @@ buildRotBank(const std::vector<Clipper2Lib::Path64> &local,
                 g.aref = (!inflated.empty()) ? inflated[0] : g.path;
             } else {
                 g.aref = g.path;
+            }
+
+            // ── Le NFP ne voit pas le contour exact, il en voit une copie allégée ───────────────
+            //
+            // `aref` n'a qu'un lecteur : la somme de Minkowski du NFP. Or cette somme est une
+            // convolution n × m — son coût est **quadratique en sommets**. Mesuré le 26-10-2026 sur
+            // un run d'impression réel : 90 sommets par contour gonflé, ~2000 sommes, **73 ms
+            // chacune**, 145 s de moteur sur un run de 2 min 32. Rien d'autre ne pèse.
+            //
+            // ⚠️ **La tolérance est minuscule devant le jeu, et c'est ce qui la rend sûre.** Le jeu
+            // de ce run vaut 18,9 px ; on simplifie à 0,5 px, soit trente-huit fois moins. Deux
+            // contours que la simplification rapproche de 0,5 px restent donc séparés par plus de
+            // 18 px : le plan ne peut pas se recouvrir. Mesuré sur le run : le plan est identique au
+            // centième de millimètre (`usedHeight` 1211,09 mm avant comme après), et le moteur passe
+            // de 142,7 s à 52,3 s.
+            //
+            // ⚠️ Et **seul `aref` est simplifié** : `path` reste le contour exact, donc le dessin,
+            // le PDF et le payload gardent leur géométrie au bit près. Le NFP est un test, pas un
+            // tracé.
+            //
+            // La tolérance est dérivée du JEU, jamais fixée en dur : un vingtième du jeu, plafonné à
+            // `kNfpSimplifyEpsilon`. Un run sans jeu n'est pas simplifié du tout — sans jeu, il n'y
+            // a plus de marge pour absorber l'approximation.
+            if (gapRadius > 0 && g.aref.size() >= 4) {
+                const double tolerance = std::min(kNfpSimplifyEpsilon, static_cast<double>(gapRadius) * 0.05);
+                g.aref = Clipper2Lib::SimplifyPath(g.aref, tolerance, true);
             }
             rotBank[i].push_back(std::move(g));
         }
