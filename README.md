@@ -7,6 +7,8 @@ It is a library, not an application: it has no window of its own. It is the
 nesting engine shared by Ostara and Rabnest, written by the same author and
 published under the same licence.
 
+Source code: https://github.com/equinox-patterns/Trame
+
 ## License
 
 Trame is free software: you can redistribute it and/or modify it under the terms
