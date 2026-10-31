@@ -87,6 +87,12 @@ set(TRAME_HEADERS
 
 add_library(Trame STATIC ${TRAME_SOURCES} ${TRAME_HEADERS})
 
+# M_PI n'existe pas sous MSVC tant que _USE_MATH_DEFINES n'est pas défini avant <cmath>.
+# PUBLIC : Ostara et Rabnest en ont besoin aussi, et ils incluent les mêmes en-têtes.
+if(MSVC)
+    target_compile_definitions(Trame PUBLIC _USE_MATH_DEFINES)
+endif()
+
 # PUBLIC : les en-têtes s'incluent par chemin racine ("model/Piece.h",
 # "nesting/Engine.h") — depuis Trame comme depuis ses consommateurs.
 target_include_directories(Trame PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
