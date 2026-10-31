@@ -19,6 +19,19 @@ if(NOT TARGET Clipper2)
     set(CLIPPER2_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(CLIPPER2_TESTS OFF CACHE BOOL "" FORCE)
     add_subdirectory(third_party/clipper2/CPP EXCLUDE_FROM_ALL)
+
+    # Le CMake de Clipper2 pose -Werror sur sa propre cible. Sur GCC 12 (Ubuntu 22.04, la CI),
+    # clipper.triangulation.cpp déclenche « 'ec' may be used uninitialized » et la compilation
+    # s'arrête. On ne corrige pas du code tiers : on retire -Werror de ses deux cibles.
+    foreach(_clipper_target Clipper2 Clipper2Z)
+        if(TARGET ${_clipper_target})
+            get_target_property(_clipper_opts ${_clipper_target} COMPILE_OPTIONS)
+            if(_clipper_opts)
+                list(REMOVE_ITEM _clipper_opts -Werror)
+                set_target_properties(${_clipper_target} PROPERTIES COMPILE_OPTIONS "${_clipper_opts}")
+            endif()
+        endif()
+    endforeach()
 endif()
 
 # ── ZLIB ───────────────────────────────────────────────────────────────────
