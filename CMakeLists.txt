@@ -114,19 +114,3 @@ target_link_libraries(svg2ocgpdf PRIVATE Trame Qt6::Widgets)
 # Il ne sert qu'à prouver l'aller-retour — écrire une charge utile, la relire à l'identique.
 add_executable(pdfpayload tools/pdfpayload.cpp)
 target_link_libraries(pdfpayload PRIVATE Trame)
-
-add_executable(svg2pdf tests/svg2pdf.cpp)
-target_link_libraries(svg2pdf PRIVATE
-    Qt6::Widgets Qt6::Svg Qt6::SvgWidgets Qt6::Xml Qt6::PrintSupport)
-
-# Harnais headless de non-régression — rejoue le pipeline complet sans UI.
-# C'est le seul moyen de vérifier nesting/ + io/ : l'appli est une GUI sans
-# arguments, et il n'existe aucun test automatisé dans ce dépôt.
-add_executable(nestbench tests/nestbench.cpp)
-target_link_libraries(nestbench PRIVATE Trame)
-
-# Instrument de mesure — il ne vérifie rien, il chiffre : rejoue un nesting et
-# mesure le dégagement réellement obtenu entre les contours posés, au lieu de
-# le déduire de la lecture du moteur. Voir tests/gapbench.cpp.
-add_executable(gapbench tests/gapbench.cpp)
-target_link_libraries(gapbench PRIVATE Trame)
