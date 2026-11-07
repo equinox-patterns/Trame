@@ -502,7 +502,8 @@ TiledEngine::TiledEngine(const Spec &spec) noexcept
 //---------------------------------------------------------------------------------------------------------------------
 std::vector<Placement> TiledEngine::place(const Bin &bin,
                                           const std::vector<Clipper2Lib::Path64> &pieces,
-                                          bool *abandoned) const
+                                          bool *abandoned,
+                                          NestGeom::NFPCache *sharedNfp) const
 {
     if (abandoned != nullptr)
         *abandoned = false;
@@ -580,8 +581,14 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     std::vector<Placed> placed;
     placed.reserve(N);
 
-    NestGeom::NFPCache nfpCache;
-    nfpCache.reserve(std::size_t(N) * numRots * 4);
+    // Le cache des sommes de non-recouvrement : celui de l'appelant quand il en garde un d'un plan
+    // à l'autre, le nôtre sinon. Voir la note dans l'en-tête — c'est le poste de dépense du moteur.
+    NestGeom::NFPCache ownNfpCache;
+    NestGeom::NFPCache &nfpCache = sharedNfp != nullptr ? *sharedNfp : ownNfpCache;
+    if (sharedNfp == nullptr)
+    {
+        nfpCache.reserve(std::size_t(N) * numRots * 4);
+    }
 
     // The bin's forbidden zones as engine geometry, built ONCE — the row loop below asks
     // feasibleRegion four times per piece per attempt, and rebuilding K inflations there

@@ -162,9 +162,23 @@ public:
     /// produced.
     /// @p abandoned is set to true when the run was given up — see Engine::place, whose contract
     /// this one shares: what comes back from an abandoned run is a half-built plan.
+    ///
+    /// @p sharedNfp  a non-recurring cache the CALLER may keep across several plans of the same run.
+    ///
+    /// **Le poste de dépense de ce moteur, et de loin, c'est la somme de non-recouvrement** (un
+    /// couple pièce/orientation contre un autre) : plusieurs millisecondes par couple sur un contour
+    /// de patron. Un run tuilé demande PLUSIEURS plans à partir des MÊMES pièces — trois ordres, et
+    /// deux orientations de feuille quand le format le permet — et sans ce cache chacun les
+    /// recalculait tous : mesuré le 07-11-2026, 5,4 s pour UN plan de 24 pièces, donc 32 s pour les
+    /// six d'un A0, et treize minutes sur un patron plus gros.
+    ///
+    /// ⚠️ **Les préconditions sont celles du cache lui-même** : les mêmes pièces, le même jeu, les
+    /// mêmes orientations (le couple pas de rotation et nombre d'orientations fait partie de la
+    /// géométrie construite). Un appelant qui change l'un des trois doit fournir un cache neuf.
     std::vector<Placement> place(const Bin &bin,
                                  const std::vector<Clipper2Lib::Path64> &pieces,
-                                 bool *abandoned = nullptr) const;
+                                 bool *abandoned = nullptr,
+                                 NestGeom::NFPCache *sharedNfp = nullptr) const;
 
 private:
     /// Whether the caller has asked for the run to be given up. False when it handed over none.
