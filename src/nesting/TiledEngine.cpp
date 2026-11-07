@@ -52,6 +52,69 @@ struct Placed
     int64_t py;
 };
 
+/// Les bandes d'un axe où un bord du contour tomberait sur une jonction de feuilles.
+///
+/// **La contrainte est MONO-AXE, et c'est ce qui la rend exacte et bon marché.** La distance d'un
+/// contour à une jonction VERTICALE ne dépend que de x, celle à une jonction HORIZONTALE que de y.
+///
+/// **Deux bandes par ligne, jamais une de plus** — et ce n'est pas une simplification, c'est
+/// l'égalité. La mesure de `NestGeom::borderToLine` ne dépend que des DEUX extrémités du contour sur
+/// l'axe : une pièce est « près » de la ligne quand son bord droit (resp. bas) est à moins du jeu,
+/// ou son bord gauche (resp. haut), ou bien quand elle traverse mais ne dépasse pas du jeu d'un côté.
+/// Ces trois cas se réduisent à deux intervalles de largeur `2 * jeu`, centrés sur `(ligne - max)`
+/// et sur `(ligne - min)` ; entre les deux, la pièce traverse franchement et n'a rien à craindre.
+///
+/// ⚠️ **Une version « un sommet près de la ligne » a été écrite d'abord, et elle était fausse** : elle
+/// interdisait aussi les pièces qui traversent une jonction avec de grandes parties de chaque côté —
+/// c'est-à-dire des pièces parfaitement saines, et des plans qui auraient perdu des feuilles pour
+/// rien. C'est la mesure du moteur qui fait foi, pas une idée de ce qu'elle devrait être.
+///
+/// Mesuré le 07-11-2026 sur un plan d'impression réel : une pièce posée à **1,7 mm** d'une jonction,
+/// bord parallèle. En A4, cette bande-là est dans la zone que l'imprimante n'imprime pas — le PDF
+/// était inutilisable, et rien dans ce moteur ne l'empêchait.
+auto JunctionBands(const Clipper2Lib::Path64 &path,
+                   const std::vector<int64_t> &lines, bool vertical,
+                   int64_t gapR, int64_t spanX, int64_t spanY) -> Clipper2Lib::Paths64
+{
+    if (path.empty() || lines.empty())
+        return {};
+
+    const BBox bb = bboxFromPath(path);
+    const int64_t lo = vertical ? bb.xMin : bb.yMin;
+    const int64_t hi = vertical ? bb.xMax : bb.yMax;
+
+    std::vector<std::pair<int64_t, int64_t>> bands;
+    bands.reserve(lines.size() * 2);
+
+    for (const int64_t line : lines)
+    {
+        // Le bord « max » de la pièce entre dans le jeu de la ligne, puis le bord « min ».
+        bands.emplace_back(line - gapR - hi, line + gapR - hi);
+        bands.emplace_back(line - gapR - lo, line + gapR - lo);
+    }
+
+    std::sort(bands.begin(), bands.end());
+
+    std::size_t kept = 0;
+    for (std::size_t i = 1; i < bands.size(); ++i)
+    {
+        if (bands[i].first <= bands[kept].second + 1)
+            bands[kept].second = std::max(bands[kept].second, bands[i].second);
+        else
+            bands[++kept] = bands[i];
+    }
+    bands.resize(kept + 1);
+
+    Clipper2Lib::Paths64 out;
+    out.reserve(bands.size());
+    for (const auto &band : bands)
+    {
+        out.push_back(vertical ? makeRect(band.first, -1, band.second, spanY + 1)
+                               : makeRect(-1, band.first, spanX + 1, band.second));
+    }
+    return out;
+}
+
 /// Where the piece (pieceIdx, rIdx) may go, inside a bounded frame.
 ///
 /// This is `Engine::placeSequential`'s inner block, with ONE difference: the
@@ -64,6 +127,7 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
                                     const NestGeom::RotGeom &bg,
                                     int pieceIdx, int rIdx,
                                     int64_t binW, int64_t envH, int64_t margin,
+                                    int64_t sheetW, int64_t sheetH, int64_t gapR,
                                     const std::vector<NestZone::Geom> &zones,
                                     NestGeom::NFPCache &nfpCache,
                                     NestGeom::NFPCache &obstacleCache)
@@ -131,6 +195,35 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
 
     clipper.Execute(Clipper2Lib::ClipType::Difference,
                     Clipper2Lib::FillRule::NonZero, out);
+
+    // ── Aucun bord de pièce sur une jonction de feuilles ──────────────────
+    //
+    // Retiré de la RÉGION, et pas vérifié après coup : une position qui rase une jonction n'est plus
+    // une position candidate. C'est ce qui manquait — le plan tombait sinon sur un bord à 1,7 mm
+    // qu'aucune passe ultérieure ne pouvait plus rattraper.
+    //
+    // ⚠️ Seules les jonctions INTERNES comptent : les bords du plan sont les marges, tenues par
+    // l'IFP ci-dessus, pas des lignes de coupe.
+    std::vector<int64_t> vLines;
+    for (int64_t k = 1; sheetW > 0 && k * sheetW < binW; ++k)
+        vLines.push_back(k * sheetW);
+
+    std::vector<int64_t> hLines;
+    for (int64_t k = 1; sheetH > 0 && k * sheetH < envH; ++k)
+        hLines.push_back(k * sheetH);
+
+    if (!vLines.empty() || !hLines.empty())
+    {
+        Clipper2Lib::Paths64 bands =
+            JunctionBands(bg.path, vLines, true, gapR, binW, envH);
+        const Clipper2Lib::Paths64 horizontal =
+            JunctionBands(bg.path, hLines, false, gapR, binW, envH);
+        bands.insert(bands.end(), horizontal.begin(), horizontal.end());
+
+        if (!bands.empty())
+            out = Clipper2Lib::Difference(out, bands, Clipper2Lib::FillRule::NonZero);
+    }
+
     return out;
 }
 
@@ -173,6 +266,60 @@ auto Extremes(const Clipper2Lib::Paths64 &region) -> std::vector<Clipper2Lib::Po
     return out;
 }
 
+/// La pièce POSÉE telle que l'hôte la dessine — contour absolu, boîte, et les cases rencontrées.
+///
+/// ⚠️ **Un seul endroit sait dessiner une pièce posée.** Le compte du plan (`TouchedCells`) et le
+/// compte d'UNE pièce (la passe page par pièce) doivent tomber d'accord à la case près : deux
+/// formulations de la même convention, et le juge compte faux d'une case.
+struct DrawnPiece
+{
+    Clipper2Lib::Path64 abs;    ///< Le contour absolu, dans les coordonnées du bin
+    BBox                bbox;   ///< Sa boîte — c'est elle que la grille découpe
+    std::set<int64_t>   cells;  ///< Les cases qu'il RENCONTRE, indexées `r * cols + c`
+};
+
+auto DrawPiece(const std::vector<std::vector<NestGeom::RotGeom>> &rotBank,
+               int pieceIdx, int rotIdx, double stepDeg,
+               int64_t px, int64_t py,
+               int64_t sheetW, int64_t sheetH, int64_t cols, int64_t rows) -> DrawnPiece
+{
+    DrawnPiece d;
+
+    // ⚠️ **Le contour tel qu'il est DESSINÉ, et non tel que le moteur le range.** La
+    // convention de l'hôte — et celle de `NestedSvgWriter` — est
+    // `translate(x, y) · rotate(deg) · translate(-ox, -oy)` : le placement porte le coin min
+    // de la pièce **NON tournée**, et l'angle s'applique autour de lui.
+    //
+    // On repart donc de la rotation 0, on tourne, on translate — la reconstruction que répliquent
+    // déjà `Engine::UsedHeight` et `NestedSvgWriter`.
+    d.abs  = NestGeom::translatePath(
+        NestGeom::rotatePath(rotBank[pieceIdx][0].path, rotIdx * stepDeg), px, py);
+    d.bbox = bboxFromPath(d.abs);
+
+    if (cols <= 0 || rows <= 0 || sheetW <= 0 || sheetH <= 0)
+        return d;
+
+    const int64_t c0 = std::max<int64_t>(0, d.bbox.xMin / sheetW);
+    const int64_t c1 = std::min<int64_t>(cols - 1, d.bbox.xMax / sheetW);
+    const int64_t r0 = std::max<int64_t>(0, d.bbox.yMin / sheetH);
+    const int64_t r1 = std::min<int64_t>(rows - 1, d.bbox.yMax / sheetH);
+
+    for (int64_t r = r0; r <= r1; ++r)
+    {
+        for (int64_t c = c0; c <= c1; ++c)
+        {
+            const Clipper2Lib::Path64 cell =
+                makeRect(c * sheetW, r * sheetH, (c + 1) * sheetW, (r + 1) * sheetH);
+            if (!Clipper2Lib::Intersect({d.abs}, {cell}, Clipper2Lib::FillRule::NonZero).empty())
+            {
+                d.cells.insert(r * cols + c);
+            }
+        }
+    }
+
+    return d;
+}
+
 /// Les cases de la grille de tuliage qu'un ensemble de pièces posées rencontre.
 ///
 /// ⚠️ **Second exemplaire assumé d'une règle dont `OExportSheets::Compute` est l'autorité** dans
@@ -193,37 +340,10 @@ auto TouchedCells(const std::vector<Placed> &placed,
 
     for (const Placed &p : placed)
     {
-        // ⚠️ **Le contour tel qu'il est DESSINÉ, et non tel que le moteur le range.** La
-        // convention de l'hôte — et celle de `NestedSvgWriter` — est
-        // `translate(x, y) · rotate(deg) · translate(-ox, -oy)` : le placement porte le coin min
-        // de la pièce **NON tournée**, et l'angle s'applique autour de lui.
-        //
-        // `rotBank[i][rotIdx].path` est la pièce tournée **puis re-normalisée sur SON propre coin
-        // min** : la translater de (px, py) plaçait le coin de la pièce tournée, pas celui de la
-        // pièce d'origine — un décalage d'une case, et un juge qui compte faux. On repart donc de
-        // la rotation 0, on tourne, on translate.
-        const Clipper2Lib::Path64 abs = NestGeom::translatePath(
-            NestGeom::rotatePath(rotBank[p.pieceIdx][0].path, p.rotIdx * stepDeg), p.px, p.py);
-        const BBox bb = bboxFromPath(abs);
-        deepest = std::max(deepest, bb.yMax);
-
-        const int64_t c0 = std::max<int64_t>(0, bb.xMin / sheetW);
-        const int64_t c1 = std::min<int64_t>(cols - 1, bb.xMax / sheetW);
-        const int64_t r0 = std::max<int64_t>(0, bb.yMin / sheetH);
-        const int64_t r1 = std::min<int64_t>(rows - 1, bb.yMax / sheetH);
-
-        for (int64_t r = r0; r <= r1; ++r)
-        {
-            for (int64_t c = c0; c <= c1; ++c)
-            {
-                const Clipper2Lib::Path64 cell =
-                    makeRect(c * sheetW, r * sheetH, (c + 1) * sheetW, (r + 1) * sheetH);
-                if (!Clipper2Lib::Intersect({abs}, {cell}, Clipper2Lib::FillRule::NonZero).empty())
-                {
-                    touched.insert(r * cols + c);
-                }
-            }
-        }
+        const DrawnPiece d = DrawPiece(rotBank, p.pieceIdx, p.rotIdx, stepDeg, p.px, p.py,
+                                       sheetW, sheetH, cols, rows);
+        deepest = std::max(deepest, d.bbox.yMax);
+        touched.insert(d.cells.begin(), d.cells.end());
     }
 
     if (maxY != nullptr)
@@ -330,6 +450,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     const int64_t margin = static_cast<int64_t>(bin.marginMm() * kScale);
     const int64_t gapR   = static_cast<int64_t>(m_spec.gap * kScale);
     const int64_t sheetH = static_cast<int64_t>(m_spec.sheetHeight * kScale);
+    const int64_t sheetW = static_cast<int64_t>(m_spec.sheetWidth * kScale);
 
     if (binW <= 0 || sheetH <= 0)
         return {};
@@ -487,6 +608,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 const Clipper2Lib::Paths64 region =
                     feasibleRegion(placed, rotBank, rotBank[pieceIdx][rIdx],
                                    pieceIdx, rIdx, binW, envH, margin,
+                                   sheetW, sheetH, gapR,
                                    zones, nfpCache, obstacleCache);
 
                 const Clipper2Lib::Point64 pos = findBottomLeft(region);
@@ -572,7 +694,6 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     // accepté que s'il fait **strictement** baisser ce compte — **le plan ne peut pas sortir pire
     // de cette passe**, et c'est ce qui la rend sûre à poser sur tous les runs tuilés, page de
     // garde ou non.
-    const int64_t sheetW = static_cast<int64_t>(m_spec.sheetWidth * kScale);
     const int64_t cols = sheetW > 0 ? binW / sheetW : 0;
 
     // Le meilleur plan traversé par la passe. Vide quand elle n'a pas tourné — et c'est ce vide
@@ -708,8 +829,8 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 {
                     const Clipper2Lib::Paths64 region =
                         feasibleRegion(without, rotBank, rotBank[candidate.pieceIdx][rIdx],
-                                       candidate.pieceIdx, rIdx, binW, rows * sheetH, margin, zones,
-                                       nfpCache, obstacleCache);
+                                       candidate.pieceIdx, rIdx, binW, rows * sheetH, margin,
+                                       sheetW, sheetH, gapR, zones, nfpCache, obstacleCache);
 
                     for (const Clipper2Lib::Point64 &pos : Extremes(region))
                     {
@@ -757,6 +878,11 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             out[q.pieceIdx].rotation = q.rotIdx * stepDeg;
         }
     }
+
+    // ⚠️ **Le moins de feuilles PAR PIÈCE ne se juge pas ici.** Un plan tuilé n'est reposé qu'une
+    // fois choisi : c'est `PageRepack` qui le fait, sur le plan qui s'imprime réellement — celui du
+    // moteur tuilé quand il gagne l'arbitrage, celui de la bande quand il ne le gagne pas. Le faire
+    // ici aurait rendu le gain invisible dans le second cas, ce qui est arrivé.
 
     return out;
 }

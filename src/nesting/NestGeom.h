@@ -159,6 +159,37 @@ simplifyForNesting(const std::vector<Clipper2Lib::Path64> &pieces, int64_t toler
     return out;
 }
 
+/// How close a footprint border runs to a cut line — the number that matters for a TILED plan.
+///
+/// Crossing a line is NOT the defect: a piece larger than an artboard is cut, that is what tiling is
+/// for. The defect is a BORDER that runs along the line, either by stopping just short of it or by
+/// poking only a hair past it. So a crossing piece is measured by its **thinnest protrusion**: a
+/// piece cut through the middle has two large ones and is left alone, a piece that pokes one
+/// millimetre past counts.
+///
+/// **Une seule définition, deux lecteurs.** La passe d'alignement du moteur de bande
+/// (`Engine::refine`) s'en sert comme d'un score — elle rapproche les bords des lignes en espérant
+/// en libérer une — et le reposage (`PageRepack`) comme d'un refus : un bord à moins du jeu d'une
+/// jonction est le défaut que Sophie voit sur le papier. Deux formulations de cette distance
+/// laisseraient l'un poser ce que l'autre interdit.
+inline double borderToLine(const Clipper2Lib::Path64 &path, int64_t coord, bool vertical)
+{
+    double minAbs   = (std::numeric_limits<double>::max)();
+    double maxLeft  = 0.0;
+    double maxRight = 0.0;
+
+    for (const Clipper2Lib::Point64 &p : path) {
+        const double d = static_cast<double>((vertical ? p.x : p.y) - coord);
+
+        minAbs = std::min(minAbs, std::abs(d));
+        if (d <= 0.0) { maxLeft  = std::max(maxLeft, -d); }
+        if (d >= 0.0) { maxRight = std::max(maxRight,  d); }
+    }
+
+    const bool crosses = (maxLeft > 0.0 && maxRight > 0.0);
+    return crosses ? std::min(maxLeft, maxRight) : minAbs;
+}
+
 inline BBox bboxFromPath(const Clipper2Lib::Path64 &path)
 {
     BBox b = {(std::numeric_limits<int64_t>::max)(),

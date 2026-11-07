@@ -57,6 +57,7 @@ set(TRAME_SOURCES
     src/nesting/Engine.cpp
     src/nesting/EngineRefine.cpp
     src/nesting/Footprint.cpp
+    src/nesting/PageRepack.cpp
     src/nesting/TiledEngine.cpp
     src/pdf/PdfPayload.cpp
     src/pdf/SvgToOcgPdf.cpp
@@ -78,6 +79,7 @@ set(TRAME_HEADERS
     src/nesting/Engine.h
     src/nesting/Footprint.h
     src/nesting/NestGeom.h
+    src/nesting/PageRepack.h
     src/nesting/TiledEngine.h
     src/nesting/ZoneGeom.h
     src/pdf/PdfBuilder.h

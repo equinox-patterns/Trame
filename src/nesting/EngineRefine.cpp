@@ -90,33 +90,6 @@ Point64 Delta(int64_t dx, int64_t dy)
     return Point64(dx, dy);
 }
 
-/// How close a footprint border runs to a cut line — the number that matters.
-///
-/// Crossing a line is NOT the defect: a piece larger than an artboard is cut,
-/// that is what tiling is for. The defect is a BORDER that runs along the line,
-/// either by stopping just short of it or by poking only a hair past it. So a
-/// crossing piece is measured by its **thinnest protrusion**: a piece cut
-/// through the middle has two large ones and is left alone, a piece that pokes
-/// one millimetre past counts.
-double BorderToLine(const Path64 &c, int64_t coord, bool vertical)
-{
-    double minAbs   = std::numeric_limits<double>::max();
-    double maxLeft  = 0.0;
-    double maxRight = 0.0;
-
-    for (const Point64 &p : c)
-    {
-        const double d = static_cast<double>((vertical ? p.x : p.y) - coord);
-
-        minAbs = std::min(minAbs, std::abs(d));
-        if (d <= 0.0) { maxLeft  = std::max(maxLeft, -d); }
-        if (d >= 0.0) { maxRight = std::max(maxRight,  d); }
-    }
-
-    const bool crosses = (maxLeft > 0.0 && maxRight > 0.0);
-    return crosses ? std::min(maxLeft, maxRight) : minAbs;
-}
-
 } // namespace
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -260,8 +233,8 @@ bool Engine::refine(const Bin &bin,
         {
             const Path64 c = contourAt(i, p[i]);
 
-            for (const int64_t line : vLines) { g += (BorderToLine(c, line, true)  < static_cast<double>(gapR)) ? 1 : 0; }
-            for (const int64_t line : hLines) { g += (BorderToLine(c, line, false) < static_cast<double>(gapR)) ? 1 : 0; }
+            for (const int64_t line : vLines) { g += (NestGeom::borderToLine(c, line, true)  < static_cast<double>(gapR)) ? 1 : 0; }
+            for (const int64_t line : hLines) { g += (NestGeom::borderToLine(c, line, false) < static_cast<double>(gapR)) ? 1 : 0; }
         }
 
         return g;
