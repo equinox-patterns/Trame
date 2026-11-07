@@ -159,41 +159,41 @@ enum Why : int
     WhyPiece    = 8   ///< Une autre pièce la prend
 };
 
-/// @brief Reposer @p placements sur le moins de feuilles possible.
+/// Ce que les deux passes ont fait, pièce par pièce.
 ///
-/// @p pieces est la liste des contours du plan, dans les mêmes coordonnées que les placements
-/// (celles du bin) ; @p placements leur correspond un pour un. @p bin porte la marge et les zones
-/// interdites — la page de garde, et toute feuille que le run ne doit pas imprimer.
-///
-/// Rend un vecteur de même taille et de même ordre : les pièces qui n'ont pas gagné sont rendues
-/// exactement telles quelles, et un plan qu'aucune pièce n'améliore revient identique.
-///
-/// @p report est facultatif et ne change RIEN au plan : il ne sert qu'à dire ce qui a été trouvé.
-auto Minimize(const Bin &bin,
-              const std::vector<Clipper2Lib::Path64> &pieces,
-              const std::vector<Placement> &placements,
-              const Frame &frame,
-              Report *report = nullptr) -> std::vector<Placement>;
+/// L'instrumentation qui a trouvé les erreurs de mise au point de ce module — elle ne coûte rien
+/// quand personne ne la demande, et elle reste le seul moyen de répondre à « pourquoi cette pièce
+/// n'a pas bougé ». Rien ici ne décide : ce sont des mesures.
+struct Outcome
+{
+    Report              pages;      ///< Le reposage : feuilles avant / après, par pièce
+    std::vector<Breath> breathing;  ///< L'air : glissements mesurés et déplacements, par pièce
+};
 
-/// @brief Centrer chaque pièce dans le couloir que les règles lui laissent — « donner de l'air ».
+/// @brief Reposer un plan tuilé DÉJÀ CALCULÉ : moins de feuilles par pièce, puis de l'air.
 ///
-/// Le nesting est fini et il n'y a plus rien à gagner en feuilles : ce qui reste, c'est l'espace mal
-/// réparti. Une pièce serrée contre sa voisine d'un côté et loin de tout de l'autre n'est pas
-/// fausse, elle est inconfortable — à couper, à lire, à poser. Cette passe mesure **jusqu'où la
-/// pièce peut encore glisser de chaque côté**, puis la décale de la moitié de la différence : deux
-/// écarts inégaux deviennent deux écarts égaux.
+/// **Le point d'entrée unique, et c'est une décision de conception, pas une commodité.** Les deux
+/// passes ont un ORDRE obligatoire — on ne répartit pas l'espace d'une pièce qu'on va déplacer — et
+/// deux fonctions publiques laissaient chaque hôte libre de les appeler à l'envers, ou pas du tout.
+/// Un hôte qui repose un plan appelle ceci, et rien d'autre.
 ///
-/// Ce que les règles laissent, et rien de plus — le jeu entre deux pièces, la marge du plan, et deux
-/// gardes reprises du reposage : **aucune feuille de plus** (les feuilles touchées restent les mêmes)
-/// et **aucun bord sur une jonction**. Une pièce qui ne peut plus boucler de 0,2 mm ne bouge pas.
+/// 1. **Le reposage** : chaque pièce est reposée sur le MOINS de feuilles. Une pièce à cheval sur six
+///    feuilles se recoupe et se recolle six fois à l'atelier ; la même sur trois, une fois.
+/// 2. **L'air** : chaque pièce est ensuite recentrée dans le couloir que les règles lui laissent —
+///    deux écarts inégaux deviennent deux écarts égaux.
 ///
-/// L'axe horizontal est traité d'abord, puis le vertical sur la position obtenue : deux couloirs
-/// indépendants, et l'ordre est là pour que le résultat soit reproductible.
-auto Breathe(const Bin &bin,
-             const std::vector<Clipper2Lib::Path64> &pieces,
-             const std::vector<Placement> &placements,
-             const Frame &frame,
-             std::vector<Breath> *report = nullptr) -> std::vector<Placement>;
+/// ⚠️ **Le plan ne peut pas sortir pire** : une pièce ne bouge que si elle touche **strictement**
+/// moins de feuilles (ou se recentre sans en toucher une de plus), aucune rangée ne s'ouvre, le
+/// nombre de feuilles imprimées ne monte jamais, et aucun bord ne s'approche d'une jonction de
+/// feuilles de plus près que le jeu. Un plan qu'aucune pièce n'améliore revient **identique**.
+///
+/// @p bin porte la marge et les zones interdites ; @p frame la grille de tuliage, lue chez l'hôte et
+/// jamais recalculée ici. Voir Modifications/Ostara/ExportMode/Nesting.md §25.
+auto Refine(const Bin &bin,
+            const std::vector<Clipper2Lib::Path64> &pieces,
+            const std::vector<Placement> &placements,
+            const Frame &frame,
+            Outcome *outcome = nullptr) -> std::vector<Placement>;
 
 /// @brief L'écart le plus faible entre un bord de pièce et une jonction de feuilles, en pixels.
 ///

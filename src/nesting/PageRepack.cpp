@@ -182,6 +182,8 @@ auto Blocked(const Clipper2Lib::Path64 &cand, const BBox &box, const std::vector
 
 } // anonymous namespace
 
+namespace
+{
 //---------------------------------------------------------------------------------------------------------------------
 auto Minimize(const Bin &bin,
               const std::vector<Clipper2Lib::Path64> &pieces,
@@ -894,6 +896,34 @@ auto Breathe(const Bin &bin,
     }
 
     return out;
+}
+
+} // anonymous namespace
+
+//---------------------------------------------------------------------------------------------------------------------
+auto Refine(const Bin &bin,
+            const std::vector<Clipper2Lib::Path64> &pieces,
+            const std::vector<Placement> &placements,
+            const Frame &frame,
+            Outcome *outcome) -> std::vector<Placement>
+{
+    // **Un seul ordre possible, et c'est le but.** Le reposage d'abord — il déplace des pièces d'un
+    // bloc à l'autre — puis l'air, qui mesure des couloirs sur le plan ainsi reposé. L'inverse
+    // répartirait l'espace d'une pièce qu'on s'apprête à déplacer, puis jetterait ce travail.
+    Report              pages;
+    std::vector<Breath> air;
+
+    std::vector<Placement> refined =
+        Minimize(bin, pieces, placements, frame, outcome != nullptr ? &pages : nullptr);
+    refined = Breathe(bin, pieces, refined, frame, outcome != nullptr ? &air : nullptr);
+
+    if (outcome != nullptr)
+    {
+        outcome->pages     = std::move(pages);
+        outcome->breathing = std::move(air);
+    }
+
+    return refined;
 }
 
 //---------------------------------------------------------------------------------------------------------------------
