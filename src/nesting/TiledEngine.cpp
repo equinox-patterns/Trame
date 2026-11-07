@@ -208,7 +208,7 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
             // ce qui permet d'imbriquer dans le creux d'une courbe, et c'est
             // toute la raison d'être de ce moteur.
             Clipper2Lib::Paths64 nfpResult =
-                Clipper2Lib::MinkowskiSum(ag.aref, bg.neg, true);
+                NestGeom::MinkowskiSumByChunks(ag.aref, bg.neg, true);
 
             for (auto &np : nfpResult)
             {
@@ -655,10 +655,27 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             return out;
         }
 
-        // Une pièce plus large que le bin ne se placera jamais, quel que soit
-        // le nombre de rangées : ouvrir boucherait sans fin. Même marqueur que
-        // le moteur de bande — l'hôte teste `rotation < 0`.
-        if (margin - b0.xMin >= binW - margin - b0.xMax)
+        // Une pièce plus large que le bin, dans TOUTES ses orientations, ne se placera jamais, quel
+        // que soit le nombre de rangées : ouvrir boucherait sans fin. Même marqueur que le moteur de
+        // bande — l'hôte teste `rotation < 0`.
+        //
+        // ⚠️ **Toutes les orientations, pas seulement la première.** `Top V2 Devant` mesure 93,1 cm
+        // à 0° pour 83,1 cm utiles : à 0° elle ne rentre pas, à 90° elle fait 77,9 cm et elle rentre.
+        // Ce test interrogeait `rotBank[pieceIdx][0]` seul et la déclarait impossible — c'est le refus
+        // « le plan ne tient pas dans la largeur » vu sur A0 le 07-11-2026, alors que le roulé, qui
+        // retire de sa banque les orientations trop larges (`Engine.cpp:589`), la posait sans peine.
+        // Une pièce n'est impossible que si AUCUNE de ses orientations ne passe en largeur.
+        bool anyNarrowerThanBin = false;
+        for (int rIdx = 0; rIdx < numRots; ++rIdx)
+        {
+            const BBox &b = rotBank[pieceIdx][rIdx].bbox;
+            if (margin - b.xMin < binW - margin - b.xMax)
+            {
+                anyNarrowerThanBin = true;
+                break;
+            }
+        }
+        if (!anyNarrowerThanBin)
         {
             out[pieceIdx].pieceIndex = pieceIdx;
             out[pieceIdx].rotation   = -1.0;

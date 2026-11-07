@@ -214,7 +214,7 @@ inline void Subtract(Clipper2Lib::Clipper64 &clipper,
             nfpZonePtr = &zit->second;
         } else {
             Clipper2Lib::Paths64 nfpZone =
-                Clipper2Lib::MinkowskiSum(z.local, bg.neg, true);
+                NestGeom::MinkowskiSumByChunks(z.local, bg.neg, true);
             // Les chemins de NFP en CCW (Clipper2 Difference exige des clips CCW).
             for (auto &np : nfpZone) {
                 if (Clipper2Lib::Area(np) < 0)

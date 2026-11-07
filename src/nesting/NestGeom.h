@@ -83,7 +83,20 @@ inline constexpr double kScale = 1e6;
 /// fidélité le plan est identique au centième de millimètre et le run trois fois plus court.
 ///
 /// ⚠️ Seul `aref` est simplifié. `path` reste exact : dessin, PDF et payload ne bougent pas.
+///
+/// ⚠️ Le mécanisme, mesuré le 07-11-2026 : ce n'est pas le nombre de sommets en soi qui coûte, c'est
+/// l'UNION des quads de la somme, superlinéaire en leur nombre (≈ Q²). Moins de sommets reste donc le
+/// bon levier — mais le premier est de ne pas faire cette union d'un seul coup : voir
+/// `MinkowskiSumByChunks` en bas de ce fichier, ×40 sur le plus gros couple réel.
 inline constexpr double kNfpSimplifyEpsilon = 0.5 * kScale;
+
+/// La taille d'un paquet d'union pour la somme de Minkowski — voir `MinkowskiSumByChunks`.
+///
+/// 2 000 est un compromis mesuré : 800 paquets va 1,4 fois plus vite sur les 91 couples mais chaque
+/// découpe ajoute son propre arrondi, donc éloigne du résultat d'un seul coup ; 8 000 et 12 000 s'en
+/// rapprochent et perdent le gain (×3,8 et ×2,2). Voir la note de la fonction pour l'ampleur de
+/// l'écart, qui reste six ordres sous la tolérance de simplification.
+inline constexpr std::size_t kMinkowskiChunk = 2000;
 
 // ── The shape of the NFP cache ──────────────────────────────────────────────
 //
@@ -487,6 +500,63 @@ normalizeToLocal(const std::vector<Clipper2Lib::Path64> &pieces)
         local[i] = translatePath(pieces[i], -bb.xMin, -bb.yMin);
     }
     return local;
+}
+
+/// ── La somme de Minkowski, mais l'union en paquets ───────────────────────────────────────────────
+///
+/// `Clipper2Lib::MinkowskiSum(A, B, true)` réunit D'UN SEUL COUP les quads que fabrique sa
+/// décomposition — un par couple de sommets. Sur une empreinte de patron (178 × 230 = 40 940 quads,
+/// la Lumineuse) cette union pèse **99,97 % du temps** : 2 911 ms pour UN couple, quand construire
+/// les quads coûte 0,8 ms. Le coût est superlinéaire (≈ Q²) parce que le balayage traite ensemble des
+/// dizaines de milliers d'arêtes qui se croisent — et le contrôle le dit : écartés les uns des
+/// autres, les MÊMES 40 940 quads s'unissent en 39 ms, soit 75 fois moins.
+///
+/// L'union est associative, donc on peut la faire en morceaux. Ce qui rend les morceaux rentables
+/// est une propriété de la décomposition : les quads sortent GROUPÉS PAR SOMMET DE `path`, donc un
+/// paquet CONTIGU est une bande spatialement localisée. Mélangés, les paquets se chevaucheraient
+/// partout et le gain disparaît — mesuré, il disparaît en effet.
+///
+/// Mesuré le 07-11-2026, Lumineuse, dans la config du moteur (aref simplifié) :
+///   plus gros couple   1 448 ms → 55 ms  (×26)
+///   les 91 couples    17,18 s → 1,85 s   (×9,3)
+///   petits couples    inchangés — sous le seuil, c'est le même code
+///
+/// ⚠️ **Ce n'est pas « identique au bit », et aucun découpage ne peut l'être** : l'union de Clipper2
+/// n'est pas associative AU BIT PRÈS, l'arrondi entier de ses points d'intersection en dépend. Mesuré
+/// sur les 91 couples : 29 identiques, 62 divergents — 23 nm au plus sur un sommet, 7e-05 mm² sur
+/// l'aire, soit six ordres de grandeur sous la simplification DÉJÀ appliquée à `aref`
+/// (`kNfpSimplifyEpsilon`, 0,13 mm). Un placement se pose sur la frontière du NFP : le plan peut
+/// donc glisser de ces nanomètres, ce qui ne déplace ni une longueur imprimée ni un nombre de
+/// pages. Ce n'est pas une approximation ajoutée au calcul, c'est le bruit d'arrondi d'une union
+/// qu'on découpe.
+///
+/// ⚠️ Le code tiers n'est PAS modifié : `Clipper2Lib::detail::Minkowski` est `inline` dans son
+/// en-tête. On l'appelle pour obtenir les quads, et on fait notre propre union.
+inline Clipper2Lib::Paths64 MinkowskiSumByChunks(const Clipper2Lib::Path64 &pattern,
+                                                 const Clipper2Lib::Path64 &path,
+                                                 bool isClosed,
+                                                 std::size_t chunkSize = kMinkowskiChunk)
+{
+    const Clipper2Lib::Paths64 quads =
+        Clipper2Lib::detail::Minkowski(pattern, path, true, isClosed);
+    if (chunkSize == 0 || quads.size() <= chunkSize)
+    {
+        // Ce que Clipper2 fait, à l'identique.
+        return Clipper2Lib::detail::Union(quads, Clipper2Lib::FillRule::NonZero);
+    }
+
+    Clipper2Lib::Paths64 partial;
+    partial.reserve(quads.size() / chunkSize + 1);
+    for (std::size_t start = 0; start < quads.size(); start += chunkSize)
+    {
+        const std::size_t end = std::min(quads.size(), start + chunkSize);
+        const Clipper2Lib::Paths64 chunk(quads.begin() + static_cast<std::ptrdiff_t>(start),
+                                         quads.begin() + static_cast<std::ptrdiff_t>(end));
+        Clipper2Lib::Paths64 merged =
+            Clipper2Lib::detail::Union(chunk, Clipper2Lib::FillRule::NonZero);
+        partial.insert(partial.end(), merged.begin(), merged.end());
+    }
+    return Clipper2Lib::detail::Union(partial, Clipper2Lib::FillRule::NonZero);
 }
 
 } // namespace NestGeom

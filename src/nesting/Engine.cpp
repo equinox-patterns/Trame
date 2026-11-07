@@ -136,7 +136,7 @@ void Engine::PrewarmNfp(const std::vector<std::vector<RotGeom>> &rotBank,
             const RotGeom &candidate = rotBank[static_cast<std::size_t>(job.bPiece)]
                                                    [static_cast<std::size_t>(job.bRot)];
             Clipper2Lib::Paths64 nfp =
-                Clipper2Lib::MinkowskiSum(placed.aref, candidate.neg, true);
+                NestGeom::MinkowskiSumByChunks(placed.aref, candidate.neg, true);
             for (auto &np : nfp)
             {
                 if (Clipper2Lib::Area(np) < 0)
@@ -311,7 +311,7 @@ double Engine::placeSequential(const Bin &bin,
                     // Full polygon is kept so concavities stay exploitable.
                     // Aref (inflated A) and negB (negated B) are precomputed.
                     Clipper2Lib::Paths64 nfpResult =
-                        Clipper2Lib::MinkowskiSum(ag.aref, bg.neg, true);
+                        NestGeom::MinkowskiSumByChunks(ag.aref, bg.neg, true);
 
                     // Ensure NFP paths are CCW (Clipper2 Difference requires CCW clips).
                     for (auto &np : nfpResult) {
