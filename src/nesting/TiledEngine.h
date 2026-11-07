@@ -91,6 +91,22 @@ public:
         /// Clear distance held between two pieces, same unit.
         double gap = 0.0;
 
+        /// **Feuilles fermées : aucune pièce à cheval sur deux feuilles.**
+        ///
+        /// Un format tuilé ordinaire découpe un plan CONTINU : une pièce qui traverse la ligne de
+        /// coupe est imprimée sur les deux feuilles, puis recollée. C'est le tuilage, et c'est ce
+        /// que le moteur fait par nature.
+        ///
+        /// Un format imprimé sur des feuilles ENTIÈRES ne le peut pas — l'A0 se plie en A4 à la
+        /// machine, il n'y a rien à recoller. Chaque feuille y est donc un bac fermé, et une pièce
+        /// doit tenir dans une seule : le moteur refuse la traversée au lieu de la compter.
+        ///
+        /// La distance tenue au bord de chaque feuille est la MARGE du bin, pas le jeu entre
+        /// pièces : le bord d'une feuille fermée est le bord du PAPIER, pas un trait de coupe.
+        ///
+        /// False par défaut — c'est ce qui garde A3, A4 et Letter exactement comme ils étaient.
+        bool closedSheets = false;
+
         /// Half a turn is a real difference for a shape; a quarter is what a
         /// hole needs. The full 2° bank the annealing uses would multiply the
         /// work by forty-five for orientations a garment piece never uses.

@@ -128,6 +128,7 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
                                     int pieceIdx, int rIdx,
                                     int64_t binW, int64_t envH, int64_t margin,
                                     int64_t sheetW, int64_t sheetH, int64_t gapR,
+                                    bool closedSheets,
                                     const std::vector<NestZone::Geom> &zones,
                                     NestGeom::NFPCache &nfpCache,
                                     NestGeom::NFPCache &obstacleCache)
@@ -142,7 +143,48 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
         return out;
 
     Clipper2Lib::Clipper64 clipper;
-    clipper.AddSubject({makeRect(ifpX0, ifpY0, ifpX1, ifpY1)});
+    if (closedSheets)
+    {
+        // ── Feuilles fermées : le cadre n'est plus un rectangle, c'est l'UNION des feuilles ──
+        //
+        // Chaque feuille rend la fenêtre des positions de référence qui y mettent la pièce
+        // ENTIÈRE, à la marge du bin sur chacun de ses quatre bords. Deux fenêtres voisines ne se
+        // touchent pas dès que la marge n'est pas nulle : une pièce ne peut donc pas enjamber une
+        // frontière — et il n'y a rien à soustraire après coup, la règle EST le cadre.
+        //
+        // C'est la MARGE du bin qui borne chaque feuille, et non le jeu entre pièces : le bord
+        // d'une feuille fermée est le bord du PAPIER, pas un trait de coupe. Voir
+        // TiledEngine::Spec::closedSheets.
+        const int64_t cols = sheetW > 0 ? (binW + sheetW - 1) / sheetW : 0;
+        Clipper2Lib::Paths64 windows;
+        windows.reserve(static_cast<std::size_t>(std::max<int64_t>(cols, 1)) * 4);
+
+        for (int64_t r = 0; r * sheetH < envH; ++r)
+        {
+            const int64_t y0 = r * sheetH + margin - bg.bbox.yMin;
+            const int64_t y1 = (r + 1) * sheetH - margin - bg.bbox.yMax;
+            if (y1 <= y0)
+                continue;
+
+            for (int64_t c = 0; c < cols; ++c)
+            {
+                const int64_t x0 = c * sheetW + margin - bg.bbox.xMin;
+                const int64_t x1 = (c + 1) * sheetW - margin - bg.bbox.xMax;
+                if (x1 <= x0)
+                    continue;
+                windows.push_back(makeRect(x0, y0, x1, y1));
+            }
+        }
+
+        if (windows.empty())
+            return out;
+
+        clipper.AddSubject(windows);
+    }
+    else
+    {
+        clipper.AddSubject({makeRect(ifpX0, ifpY0, ifpX1, ifpY1)});
+    }
 
     for (const Placed &p : placed)
     {
@@ -212,7 +254,10 @@ Clipper2Lib::Paths64 feasibleRegion(const std::vector<Placed> &placed,
     for (int64_t k = 1; sheetH > 0 && k * sheetH < envH; ++k)
         hLines.push_back(k * sheetH);
 
-    if (!vLines.empty() || !hLines.empty())
+    // ⚠️ **Rien à faire quand les feuilles sont fermées** : les fenêtres ci-dessus ont déjà porté la
+    // marge de part et d'autre de chaque frontière, ce qui interdit de la traverser en même temps
+    // que de la frôler. Les bandes de jonction ne servent qu'aux plans qu'on DÉCOUPE.
+    if (!closedSheets && (!vLines.empty() || !hLines.empty()))
     {
         Clipper2Lib::Paths64 bands =
             JunctionBands(bg.path, vLines, true, gapR, binW, envH);
@@ -391,6 +436,30 @@ auto RowsOf(int64_t deepestY, int64_t sheetH) -> int64_t
     if (sheetH <= 0 || deepestY <= 0)
         return 1;
     return std::max<int64_t>(1, (deepestY + sheetH - 1) / sheetH);
+}
+
+/// Whether any of the piece's orientations fits inside ONE closed sheet.
+///
+/// **Asked before the row loop, and it is not an optimisation.** Sans elle, une pièce plus grande
+/// qu'une feuille n'a de position dans aucune rangée : la boucle en ouvrirait jusqu'à sa borne avant
+/// de déclarer la pièce impossible, et l'utilisatrice attendrait ce temps-là pour apprendre un refus
+/// qui était décidable d'avance.
+///
+/// Les quatre orientations sont essayées, comme le placement : une pièce tournée d'un quart de tour
+/// peut tenir dans une feuille où sa forme droite ne tient pas.
+auto FitsOneSheet(const std::vector<NestGeom::RotGeom> &rots, int64_t usableW, int64_t usableH) -> bool
+{
+    if (usableW <= 0 || usableH <= 0)
+        return false;
+
+    for (const NestGeom::RotGeom &rot : rots)
+    {
+        const int64_t w = rot.bbox.xMax - rot.bbox.xMin;
+        const int64_t h = rot.bbox.yMax - rot.bbox.yMin;
+        if (w <= usableW && h <= usableH)
+            return true;
+    }
+    return false;
 }
 
 } // anonymous namespace
@@ -589,6 +658,20 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
             return out;
         }
 
+        // **Une pièce plus grande qu'une feuille, quand les feuilles sont fermées.** Aucune rangée
+        // ne la tiendra, et la boucle en ouvrirait jusqu'à sa borne avant de l'admettre.
+        //
+        // ⚠️ `continue` et non `return`, à la différence du test ci-dessus : le run va être refusé,
+        // et le refus doit nommer les pièces qui ne tiennent VRAIMENT pas — pas toutes celles qui
+        // auraient été posées après elle.
+        if (m_spec.closedSheets
+            && !FitsOneSheet(rotBank[pieceIdx], sheetW - 2 * margin, sheetH - 2 * margin))
+        {
+            out[pieceIdx].pieceIndex = pieceIdx;
+            out[pieceIdx].rotation   = -1.0;
+            continue;
+        }
+
         bool done = false;
         while (!done)
         {
@@ -608,7 +691,7 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 const Clipper2Lib::Paths64 region =
                     feasibleRegion(placed, rotBank, rotBank[pieceIdx][rIdx],
                                    pieceIdx, rIdx, binW, envH, margin,
-                                   sheetW, sheetH, gapR,
+                                   sheetW, sheetH, gapR, m_spec.closedSheets,
                                    zones, nfpCache, obstacleCache);
 
                 const Clipper2Lib::Point64 pos = findBottomLeft(region);
@@ -830,7 +913,8 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                     const Clipper2Lib::Paths64 region =
                         feasibleRegion(without, rotBank, rotBank[candidate.pieceIdx][rIdx],
                                        candidate.pieceIdx, rIdx, binW, rows * sheetH, margin,
-                                       sheetW, sheetH, gapR, zones, nfpCache, obstacleCache);
+                                       sheetW, sheetH, gapR, m_spec.closedSheets,
+                                       zones, nfpCache, obstacleCache);
 
                     for (const Clipper2Lib::Point64 &pos : Extremes(region))
                     {
