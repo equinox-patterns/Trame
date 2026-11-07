@@ -55,6 +55,19 @@ public:
         bool   freeRotation  = true;   ///< If false, pieces keep their input rotation
         int    maxIterations = 1000;   ///< Simulated annealing iterations
         int    plateauLimit  = 200;    ///< Stop if no improvement for this many iterations
+
+        /// Budget de la recherche, en millisecondes. **Zéro veut dire « pas de budget »**, le
+        /// comportement d'avant, gardé pour les appelants qui n'ont personne à faire attendre.
+        ///
+        /// ⚠️ **Sans budget, la durée d'un run ne dépend d'aucune des autres bornes.** Le recuit
+        /// enchaîne jusqu'à 456 passages de placement — le plancher de température (T ≤ 0,01 avec
+        /// 100 et 0,98) tombe avant `maxIterations`, et le frein de plateau ne pouvait pas se
+        /// déclencher avant que T passe sous 0,1, soit l'itération 343. Chaque passage replace
+        /// toutes les pièces, et chaque couple (pièce, rotation) jamais essayé coûte une somme de
+        /// Minkowski. Un plan correct existe dès le premier passage : le budget ne coupe pas la
+        /// réponse, il coupe la recherche de la réponse parfaite.
+        int    maxMilliseconds = 0;
+
         double initialTemp   = 100.0;  ///< Initial temperature
         double coolingRate   = 0.98;   ///< Temperature multiplier per iteration
 
@@ -188,6 +201,27 @@ private:
                            std::vector<Placement> &out,
                            int64_t infY) const;
 
+    /// ── Les sommes de Minkowski d'un passage, calculées de front ────────────────────────────────
+    ///
+    /// Un passage du recuit replace les pièces une à une : pour chaque pièce, le moteur soustrait du
+    /// bac les polygones de non-recouvrement (`NFP`) entre cette pièce et CHACUNE des pièces déjà
+    /// posées, à son orientation du moment. Ces sommes sont indépendantes les unes des autres, et
+    /// c'est elles qui coûtent : mesuré, 1,01 s par passage pour 14 pièces, soit ~72 ms par pièce.
+    ///
+    /// **On les calcule donc avant, sur plusieurs cœurs, et on remplit le cache.** Le placement qui
+    /// suit ne fait plus que les lire. Les valeurs sont rigoureusement les mêmes — chaque somme est
+    /// une fonction pure de ses deux orientations — donc le plan rendu est identique au bit près ;
+    /// seule l'horloge change. C'est ce qui rend cette optimisation vérifiable : la longueur ne doit
+    /// pas bouger d'un millimètre.
+    ///
+    /// ⚠️ **Rien n'est écrit dans le cache pendant que les cœurs tournent.** Chaque somme rend son
+    /// résultat dans son propre emplacement, et l'insertion se fait en série après la jonction : un
+    /// `unordered_map` partagé entre huit fils serait, lui, une course.
+    void PrewarmNfp(const std::vector<std::vector<RotGeom>> &rotBank,
+                    const std::vector<int> &rotIdx,
+                    const std::vector<int> &order,
+                    NFPCache &nfpCache) const;
+
     // ── Optimisation ─────────────────────────────────────────────────────
 
     /// @return true when the run was given up before the search ran its course.
@@ -238,6 +272,30 @@ private:
                 const std::vector<std::vector<RotGeom>> &rotBank,
                 std::vector<Placement> &best,
                 const std::vector<Clipper2Lib::Path64> &pieces) const;
+
+    /// ── La SECONDE PASSE d'un plan de bande : le blanc laissé par le recuit ────────────────────
+    ///
+    /// Un plan de bande (une laize, un rouleau, une page) n'a pas de grille : `refine()` ci-dessus
+    /// aligne des blocs sur des lignes de pages qui n'existent pas ici. Le principe reste le même —
+    /// une seconde passe, APRÈS le placement, qui ne rend jamais un plan plus long — mais le levier
+    /// n'est pas le même : dans une bande, la longueur vient de l'ORDRE dans lequel les pièces sont
+    /// posées, et le recuit part d'un ordre par surface qu'il n'a aucune raison de garder.
+    ///
+    /// Le blanc d'un plan se lit dans le plan lui-même : on relit les étages déjà posés, on en tire
+    /// plusieurs ordres (du bas, du haut, par hauteur, par largeur) et on repose les mêmes pièces aux
+    /// MÊMES orientations. Chaque repose est un `placeSequential`, donc les mêmes sommes de Minkowski
+    /// déjà en cache : le coût est de l'ordre du placement d'un plan, pas d'une recherche.
+    ///
+    /// **Le contrat est celui de `refine()` : on vérifie à la fin, et on ne commite que si le plan
+    /// est strictement plus court.** Une seconde passe qui peut allonger n'est pas une seconde passe.
+    bool refineStrip(const Bin &bin,
+                     const std::vector<std::vector<RotGeom>> &rotBank,
+                     NFPCache &nfpCache,
+                     NFPCache &obstacleCache,
+                     const std::vector<ZoneGeom> &zones,
+                     std::vector<Placement> &best,
+                     const std::vector<Clipper2Lib::Path64> &pieces,
+                     int64_t infY) const;
 
     Config m_config;
 };

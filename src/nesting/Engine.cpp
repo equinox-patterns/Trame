@@ -28,10 +28,15 @@
 #include "Bin.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cassert>
+
+#include <QDebug>
 #include <cmath>
 #include <limits>
 #include <random>
+#include <atomic>
+#include <thread>
 
 namespace {
 
@@ -75,6 +80,83 @@ using NestGeom::makeNFPCacheKey;
 //
 // Nothing is left behind as a forwarder on purpose: a `Engine::buildZoneGeom` that
 // called `NestZone::Build` would have been a second name for one function.
+
+// ── Les sommes d'un passage, de front ────────────────────────────────────────
+
+void Engine::PrewarmNfp(const std::vector<std::vector<RotGeom>> &rotBank,
+                        const std::vector<int> &rotIdx,
+                        const std::vector<int> &order,
+                        NFPCache &nfpCache) const
+{
+    struct Job
+    {
+        NestGeom::NFPCacheKey key;
+        int aPiece, aRot, bPiece, bRot;
+    };
+
+    std::vector<Job> jobs;
+    const int N = static_cast<int>(order.size());
+    jobs.reserve(static_cast<std::size_t>(N) * static_cast<std::size_t>(N) / 2 + 1);
+
+    for (int i = 1; i < N; ++i)
+    {
+        const int bPiece = order[static_cast<std::size_t>(i)];
+        const int bRot = rotIdx[static_cast<std::size_t>(bPiece)];
+        for (int j = 0; j < i; ++j)
+        {
+            const int aPiece = order[static_cast<std::size_t>(j)];
+            const int aRot = rotIdx[static_cast<std::size_t>(aPiece)];
+            const NestGeom::NFPCacheKey key = NestGeom::makeNFPCacheKey(aPiece, aRot, bPiece, bRot);
+            if (nfpCache.find(key) != nfpCache.end())
+                continue;
+            jobs.push_back({key, aPiece, aRot, bPiece, bRot});
+        }
+    }
+
+    if (jobs.empty())
+        return;
+
+    const unsigned hardware = std::thread::hardware_concurrency();
+    const unsigned threads = (std::min)(hardware == 0 ? 1u : hardware,
+                                       static_cast<unsigned>(jobs.size()));
+
+    std::vector<Clipper2Lib::Paths64> results(jobs.size());
+    std::atomic<std::size_t> next{0};
+
+    const auto worker = [&]()
+    {
+        for (;;)
+        {
+            const std::size_t index = next.fetch_add(1);
+            if (index >= jobs.size())
+                return;
+            const Job &job = jobs[index];
+            const RotGeom &placed = rotBank[static_cast<std::size_t>(job.aPiece)]
+                                                [static_cast<std::size_t>(job.aRot)];
+            const RotGeom &candidate = rotBank[static_cast<std::size_t>(job.bPiece)]
+                                                   [static_cast<std::size_t>(job.bRot)];
+            Clipper2Lib::Paths64 nfp =
+                Clipper2Lib::MinkowskiSum(placed.aref, candidate.neg, true);
+            for (auto &np : nfp)
+            {
+                if (Clipper2Lib::Area(np) < 0)
+                    std::reverse(np.begin(), np.end());
+            }
+            results[index] = std::move(nfp);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t)
+        pool.emplace_back(worker);
+    for (std::thread &thread : pool)
+        thread.join();
+
+    // L'insertion, en série : c'est le seul instant où la table est écrite.
+    for (std::size_t i = 0; i < jobs.size(); ++i)
+        nfpCache.emplace(jobs[i].key, std::move(results[i]));
+}
 
 // ── Sequential placement ─────────────────────────────────────────────────────
 
@@ -338,6 +420,8 @@ bool Engine::anneal(const Bin &bin,
             order[i] = areaIdx[i].second;
     }
 
+    PrewarmNfp(rotBank, rotIdx, order, nfpCache);
+
     std::vector<Placement> current;
     double bestHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache, zones,
                                         rotIdx, order, current, infY);
@@ -351,7 +435,29 @@ bool Engine::anneal(const Bin &bin,
 
     int plateauCount = 0;
 
+    // L'horloge du budget : lue seulement si un budget est demandé, mais posée ici pour que la
+    // boucle n'ait pas deux formes selon le réglage.
+    const auto searchStart = std::chrono::steady_clock::now();
+
     for (int iter = 0; iter < m_config.maxIterations && T > 0.01; ++iter) {
+
+        // **Le budget, s'il y en a un.** Lu une fois par itération : c'est le seul endroit où le
+        // coût d'un passage est connu sans instrumenter le placement, et un passage dure de l'ordre
+        // de la seconde sur un patron réel.
+        // ⚠️ **Et jamais tant qu'aucun plan n'est trouvé.** Le budget coupe la recherche de la
+        // réponse parfaite, pas la recherche d'une réponse : tant que `bestHeight` vaut
+        // `kBadHeight`, aucune pièce n'est posée, et s'arrêter là rend un plan vide que l'hôte
+        // annonce comme « document trop étroit » — un mensonge, et celui qui coûte le plus cher.
+        if (m_config.maxMilliseconds > 0 && bestHeight < kBadHeight * 0.5)
+        {
+            const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - searchStart).count();
+            if (spent > m_config.maxMilliseconds)
+            {
+                break;
+            }
+        }
+
         // **Asked once an iteration, which is where a run spends its time.** The annealing walks
         // the pieces hundreds of times; a request to give up that waited for the whole search
         // would be a request answered after the person asking had stopped waiting.
@@ -376,6 +482,17 @@ bool Engine::anneal(const Bin &bin,
             }
         }
 
+        // Une somme de Minkowski pèse des dizaines de kilooctets : un cache qui ne se vide jamais
+        // finirait par coûter plus cher que le calcul qu'il évite. Mesuré : le préchauffage propose
+        // jusqu'à 91 sommes par passage, pour 456 passages. On borne donc la table, et on repart à
+        // vide — les passages ne réutilisent presque jamais une orientation déjà essayée.
+        constexpr std::size_t kMaxCachedNfp = 12000;
+        if (nfpCache.size() > kMaxCachedNfp)
+            nfpCache.clear();
+
+        // Les sommes du passage, de front, avant de le poser : voir PrewarmNfp.
+        PrewarmNfp(rotBank, newRot, newOrder, nfpCache);
+
         std::vector<Placement> neighbor;
         double newHeight = placeSequential(bin, rotBank, nfpCache, obstacleCache, zones,
                                            newRot, newOrder, neighbor, infY);
@@ -395,7 +512,13 @@ bool Engine::anneal(const Bin &bin,
             ++plateauCount;
         }
 
-        if (plateauCount >= m_config.plateauLimit && T < 0.1)
+        // ⚠️ **Un palier est un palier, quelle que soit la température.** La condition `T < 0.1`
+        // rendait ce frein inatteignable avant l'itération 343 : `plateauLimit` itérations sans
+        // améliorer le meilleur plan disent que la recherche ne trouve plus rien, et attendre que
+        // le métal refroidisse ne lui fera pas trouver davantage — ça ne fait que replacer toutes
+        // les pièces trois cents fois de plus.
+        // ⚠️ Même règle : un palier de HAUTEUR ne veut rien dire sur un plan qui n'en a pas.
+        if (bestHeight < kBadHeight * 0.5 && plateauCount >= m_config.plateauLimit)
             break;
 
         T *= m_config.coolingRate;
@@ -441,10 +564,71 @@ std::vector<Placement> Engine::place(const Bin &bin,
     // complet pour que les concavités restent exploitables — sont écrites à
     // côté du code qui les applique, dans `nesting/NestGeom.h`. Elles valent
     // désormais pour les DEUX moteurs.
-    const std::vector<Clipper2Lib::Path64> local = NestGeom::normalizeToLocal(pieces);
-    const std::vector<std::vector<RotGeom>> rotBank =
+    // ── L'empreinte de nidification, allégée d'un dixième de millimètre ─────────────────────────
+    //
+    // Le dessin garde sa géométrie exacte ; c'est l'empreinte POSÉE qui est simplifiée. Gonflée du
+    // double de la tolérance avant d'être simplifiée, pour qu'elle ne puisse pas rapetisser : voir
+    // `NestGeom::simplifyForNesting`.
+    //
+    // ⚠️ **Un dixième de millimètre, et c'est une règle mesurée, pas un choix de confort.**
+    // Le plan de ce patron est emboîté au millimètre : élargir l'empreinte de chaque pièce casse les
+    // creux qui accueillent les autres, et la longueur ne bouge pas proportionnellement — elle saute.
+    // Mesuré à l'écran, taille 58 : 0,1 mm → 324,7 cm en 1 min 25 ; 0,3 mm → 339,9 cm en 20 s ;
+    // 0,5 mm → 339,9 cm en 10 s. Le saut est entre 0,1 et 0,3, et les 15 cm ne valent pas la minute
+    // gagnée. **On garde 0,1 mm.** Le gain de temps viendra d'ailleurs : le gonflement protecteur
+    // ci-dessous est la piste suivante (voir `NestGeom::simplifyForNesting`).
+    constexpr int64_t kTidyFixed = 378000; // 0,1 mm, en unités fixes (1 px = 1e6)
+    const std::vector<Clipper2Lib::Path64> tidied =
+        NestGeom::simplifyForNesting(pieces, kTidyFixed);
+
+    const std::vector<Clipper2Lib::Path64> local = NestGeom::normalizeToLocal(tidied);
+    std::vector<std::vector<RotGeom>> rotBank =
         NestGeom::buildRotBank(local, m_config.rotationStep, numRots,
                                static_cast<int64_t>(m_config.gap * kScale), allowedAngles, anchors);
+
+    // ── Le contrôle d'AVANT: une orientation plus large que le bac ne s'essaie jamais ──────────
+    //
+    // ⚠️ **Un passage abandonne TOUT dès qu'une pièce ne rentre pas en largeur** (`placeSequential`
+    // pose, puis rend `kBadHeight`). Or l'orientation de chaque pièce est tirée au sort par le
+    // recuit : sur 14 pièces dont quelques-unes frôlent la largeur utile, la chance qu'un passage
+    // les ait TOUTES dans une orientation qui rentre est faible — le recuit jetait donc presque
+    // tous ses passages et rendait un plan incomplet, en accusant le document d'être trop étroit.
+    //
+    // Mesuré sur le patron client, rouleau A0 : `Top V2 Devant` fait 87,9 cm couché à 0° pour 83,1
+    // cm utiles — elle ne rentre qu'à partir d'une rotation, et le moteur ne lui en laissait pas
+    // l'occasion. On retire donc de la banque, PIÈCE PAR PIÈCE, les orientations qui ne passent pas
+    // en largeur. Le moteur ne peut plus tirer qu'une orientation posable.
+    //
+    // Et le cas qui reste vraiment impossible — aucune orientation ne rentre — se voit ici, avant
+    // toute recherche : le run s'arrête tout de suite au lieu d'attendre des minutes pour rien.
+    // L'hôte le nomme avec sa largeur réelle (`TooNarrowFactsOf`), parce que la pièce revient non
+    // placée comme les autres.
+    {
+        const int64_t usableW = static_cast<int64_t>(std::llround(
+            (bin.widthMm() - bin.margins().left - bin.margins().right) * kScale));
+        bool impossible = false;
+        for (int i = 0; i < N && !impossible; ++i) {
+            std::vector<RotGeom> &bank = rotBank[i];
+            const auto tooWide = [usableW](const RotGeom &g) {
+                return (g.bbox.xMax - g.bbox.xMin) > usableW;
+            };
+            bank.erase(std::remove_if(bank.begin(), bank.end(), tooWide), bank.end());
+            if (bank.empty()) {
+                impossible = true;
+            }
+        }
+
+        if (impossible) {
+            // Ce que l'hôte reçoit : une pièce non placée par entrée, marquée comme telle. Il en
+            // conclut « ça ne tient pas » et NOMME la pièce dont aucune orientation ne rentre.
+            std::vector<Placement> none(static_cast<std::size_t>(N));
+            for (int i = 0; i < N; ++i) {
+                none[static_cast<std::size_t>(i)].pieceIndex = i;
+                none[static_cast<std::size_t>(i)].rotation = -1.0;
+            }
+            return none;
+        }
+    }
 
     // The bin's forbidden zones, as engine geometry, built ONCE for the whole
     // run: the annealing below calls placeSequential hundreds of times, and
@@ -457,14 +641,35 @@ std::vector<Placement> Engine::place(const Bin &bin,
     NFPCache obstacleCache; // keyed (piece, rot, zone); a zone NFP is independent of context
     obstacleCache.reserve(std::size_t(N) * numRots * std::max<std::size_t>(zones.size(), 1));
 
-    // Safe height sentinel: sum of piece heights (rotation 0) + 50% margin.
+    // ── Le plafond de hauteur : **la plus GRANDE hauteur de chaque pièce, pas celle à 0°** ──────
+    //
+    // Un plan peut toujours tenir en une seule colonne : une pièce par rangée. Sa hauteur vaut donc
+    // au plus la somme des hauteurs des pièces, chacune dans l'orientation où le moteur la pose.
+    // Ce plafond-ci est le seul qui ne puisse pas refuser un plan qui existe.
+    //
+    // ⚠️ **Il se calculait sur la hauteur à 0°**, plus 50 %. Or une pièce presque aussi large que le
+    // bac ne rentre en largeur qu'en se couchant — et couchée elle est bien plus HAUTE qu'à 0°. Sur
+    // les grandes tailles, la somme des hauteurs réellement posées dépassait alors le plafond, et le
+    // placement rendait « aucune place » sur un plan qui tenait : l'hôte annonçait « document trop
+    // étroit » pour des pièces qui rentraient. C'est le plafond qui était faux, pas la place.
+    //
+    // Les marges s'ajoutent : le plafond est comparé à une ordonnée absolue dans le bac, pas à une
+    // hauteur. Sans elles, un bac qui réserve de l'espace en haut et en bas refusait la dernière
+    // rangée d'un plan qui tenait exactement.
     int64_t totalH = 0;
     for (int i = 0; i < N; ++i) {
         if (rotBank[i].empty())
             continue;
-        totalH += rotBank[i][0].bbox.yMax - rotBank[i][0].bbox.yMin;
+        int64_t tallest = 0;
+        for (const RotGeom &rot : rotBank[i]) {
+            const int64_t h = rot.bbox.yMax - rot.bbox.yMin;
+            if (h > tallest)
+                tallest = h;
+        }
+        totalH += tallest;
     }
-    totalH = totalH + totalH / 2;
+    totalH += static_cast<int64_t>(bin.margins().top * kScale);
+    totalH += static_cast<int64_t>(bin.margins().bottom * kScale);
     constexpr int64_t kMaxSafe = int64_t(1) << 50;
     const int64_t infY = totalH > 0 ? totalH : kMaxSafe;
 
@@ -499,6 +704,20 @@ std::vector<Placement> Engine::place(const Bin &bin,
                                       [](Anchor a) { return a != Anchor::Free; });
     if (!anyGlued && m_config.artboardCount > 0 && m_config.artboardHeight > 0.0) {
         if (refine(bin, rotBank, best, pieces)) {
+            if (abandoned != nullptr)
+                *abandoned = true;
+        }
+    } else if (!anyGlued) {
+        // ── Le plan de BANDE a sa seconde passe aussi ─────────────────────────────────────────
+        //
+        // Sans grille, il n'y a pas de lignes de pages à aligner — mais il reste le blanc entre les
+        // pièces, et la longueur qu'il coûte. `refineStrip` relit les étages du plan, en tire
+        // plusieurs ordres et repose les mêmes pièces aux mêmes orientations ; elle ne commite que
+        // si le plan est strictement plus court. Voir EngineRefine.cpp.
+        //
+        // ⚠️ Jamais sur un plan qui a une pièce collée à un bord : cette passe repose les pièces
+        // dans un autre ordre, et une pièce collée au pli qui se déplace est une pièce hors du pli.
+        if (refineStrip(bin, rotBank, nfpCache, obstacleCache, zones, best, pieces, infY)) {
             if (abandoned != nullptr)
                 *abandoned = true;
         }

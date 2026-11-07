@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+
 #include <limits>
 #include <vector>
 
@@ -585,5 +586,170 @@ bool Engine::refine(const Bin &bin,
     // abandonment — which is every tiled plan the pass improved, and only those: a rolled-back
     // pass (the two returns above) kept its plan. Measured on the framed formats, whose geometry
     // is the one the pass succeeds on: 95 seconds of annealing, then nothing on screen.
+    return false;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+// ── La seconde passe d'un plan de BANDE ────────────────────────────────────────────────────────────
+//
+// Pas de grille, donc pas d'alignement sur des lignes de pages : ce qui reste à gagner dans une
+// bande, c'est le blanc que le recuit a laissé entre les pièces. Il ne se voit pas dans la hauteur
+// — il se voit dans le plan : les étages sont déjà posés, et l'ORDRE qui les a produits est un ordre
+// par surface que rien ne justifie.
+//
+// On relit donc les étages du plan, on en tire quatre ordres, et on repose les mêmes pièces aux
+// MÊMES orientations. Aucune géométrie nouvelle n'est calculée : les sommes de Minkowski du premier
+// passage sont dans `nfpCache`, ce qui rend chaque repose à peu près gratuit.
+//
+// **Et le contrat de la passe tuilée est tenu ici aussi** : on compare, et on ne commite que si le
+// plan est STRICTEMENT plus court. Une seconde passe ne peut pas coûter du papier.
+bool Engine::refineStrip(const Bin &bin,
+                         const std::vector<std::vector<RotGeom>> &rotBank,
+                         NFPCache &nfpCache,
+                         NFPCache &obstacleCache,
+                         const std::vector<ZoneGeom> &zones,
+                         std::vector<Placement> &best,
+                         const std::vector<Clipper2Lib::Path64> &pieces,
+                         int64_t infY) const
+{
+    const int N = static_cast<int>(rotBank.size());
+    if (N == 0 || static_cast<int>(best.size()) != N)
+    {
+        return false;
+    }
+
+    // Un plan qui n'a pas posé tout le monde n'a pas d'étages à relire : c'est le recuit qui doit
+    // rendre un plan, pas cette passe.
+    for (const Placement &p : best)
+    {
+        if (p.rotation < 0.0)
+        {
+            return false;
+        }
+    }
+
+    const double startHeight = UsedHeight(best, pieces, bin);
+    if (!(startHeight > 0.0))
+    {
+        return false;
+    }
+
+    // L'orientation de chaque pièce dans le plan, retrouvée dans sa banque. `isBetterAngle` ne
+    // s'applique pas : l'angle vient de la banque, il y est donc à l'identique.
+    std::vector<int> rotIdx(N, 0);
+    for (int i = 0; i < N; ++i)
+    {
+        int found = -1;
+        double bestDelta = 1e9;
+        for (int r = 0; r < static_cast<int>(rotBank[i].size()); ++r)
+        {
+            const double delta = std::fabs(rotBank[i][r].angle - best[i].rotation);
+            if (delta < bestDelta)
+            {
+                bestDelta = delta;
+                found = r;
+            }
+        }
+        if (found < 0)
+        {
+            return false;
+        }
+        rotIdx[i] = found;
+    }
+
+    std::vector<int> identity(N);
+    for (int i = 0; i < N; ++i)
+    {
+        identity[i] = i;
+    }
+
+    // Les quatre lectures du plan. Toutes sont des ORDRES, aucun n'est une position : on ne déplace
+    // rien à la main, on repose. C'est le seul levier dont dispose une bande sans grille.
+    std::vector<std::vector<int>> candidates;
+
+    std::vector<int> byBottom = identity;
+    std::sort(byBottom.begin(), byBottom.end(),
+              [&best](int a, int b) { return best[a].y < best[b].y; });
+    candidates.push_back(byBottom);
+
+    std::vector<int> byTop = byBottom;
+    std::reverse(byTop.begin(), byTop.end());
+    candidates.push_back(byTop);
+
+    std::vector<int> byHeight = identity;
+    std::sort(byHeight.begin(), byHeight.end(), [&](int a, int b)
+    {
+        const BBox &ba = rotBank[a][rotIdx[a]].bbox;
+        const BBox &bb = rotBank[b][rotIdx[b]].bbox;
+        return (ba.yMax - ba.yMin) > (bb.yMax - bb.yMin);
+    });
+    candidates.push_back(byHeight);
+
+    std::vector<int> byWidth = identity;
+    std::sort(byWidth.begin(), byWidth.end(), [&](int a, int b)
+    {
+        const BBox &ba = rotBank[a][rotIdx[a]].bbox;
+        const BBox &bb = rotBank[b][rotIdx[b]].bbox;
+        return (ba.xMax - ba.xMin) > (bb.xMax - bb.xMin);
+    });
+    candidates.push_back(byWidth);
+
+    std::vector<Placement> winner = best;
+    double winnerHeight = startHeight;
+    bool improved = false;
+
+    for (const std::vector<int> &order : candidates)
+    {
+        if (IsAbandoned())
+        {
+            return true;
+        }
+
+        std::vector<Placement> trial;
+        const double height = placeSequential(bin, rotBank, nfpCache, obstacleCache, zones,
+                                              rotIdx, order, trial, infY);
+        if (!(height < winnerHeight))
+        {
+            continue;
+        }
+
+        // **Un plan complet, ou rien.** Une repose qui abandonne une pièce rend un plan incomplet,
+        // et un plan incomplet n'est pas plus court : il est faux.
+        if (static_cast<int>(trial.size()) != N)
+        {
+            continue;
+        }
+        bool whole = true;
+        for (const Placement &p : trial)
+        {
+            if (p.rotation < 0.0)
+            {
+                whole = false;
+                break;
+            }
+        }
+        if (!whole)
+        {
+            continue;
+        }
+
+        winner = std::move(trial);
+        winnerHeight = height;
+        improved = true;
+
+    }
+
+    if (!improved)
+    {
+        return false;
+    }
+
+    // Le contrat, vérifié une dernière fois : on ne commite pas un plan plus long que celui d'entrée.
+    if (!(UsedHeight(winner, pieces, bin) < startHeight))
+    {
+        return false;
+    }
+
+    best = std::move(winner);
     return false;
 }

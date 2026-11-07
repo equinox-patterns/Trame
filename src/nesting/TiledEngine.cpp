@@ -422,17 +422,16 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
     // Le pire cas légal : chaque pièce seule dans sa bande. Une pièce qui n'est pas
     // entrée en si peu de rangées n'entrera jamais.
     //
-    // ⚠️ Lue SEULEMENT s'il y a des zones. Sans zone la boucle est laissée
-    // exactement telle qu'elle était, et un run sans page de garde ne peut pas être
-    // changé par un garde-fou qui ne se lit pas.
+    // ⚠️ **Lue TOUJOURS, zones ou pas.** La borne ne parle pas des zones : elle dit qu'une
+    // pièce qui n'est pas entrée en autant de rangées que ses propres hauteurs n'entrera
+    // jamais. Tant qu'elle n'était armée que s'il y avait des zones, un run sans page de
+    // garde — A4, rouleau A0 — n'avait aucune borne : la boucle ouvrait des rangées
+    // indéfiniment et le run ne rendait pas la main.
     int64_t maxRows = 1;
-    if (!zones.empty())
+    for (int i = 0; i < N; ++i)
     {
-        for (int i = 0; i < N; ++i)
-        {
-            const BBox &b = rotBank[i][0].bbox;
-            maxRows += (b.yMax - b.yMin + sheetH - 1) / sheetH;
-        }
+        const BBox &b = rotBank[i][0].bbox;
+        maxRows += (b.yMax - b.yMin + sheetH - 1) / sheetH;
     }
 
     for (const int pieceIdx : order)
@@ -447,6 +446,17 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
         }
 
         const BBox &b0 = rotBank[pieceIdx][0].bbox;
+
+        // ⚠️ **Une empreinte invalide ne se place jamais** — et pire, elle rend tout le reste
+        // incomparable : un NaN dans la boîte fait échouer `rows >= maxRows` comme tous les tests
+        // de placement, et la boucle ouvre des rangées sans fin. Une géométrie non finie est donc
+        // déclarée « pièce impossible », comme une pièce trop large : même marqueur, `rotation < 0`.
+        if (!(b0.xMax >= b0.xMin) || !(b0.yMax >= b0.yMin))
+        {
+            out[pieceIdx].pieceIndex = pieceIdx;
+            out[pieceIdx].rotation   = -1.0;
+            return out;
+        }
 
         // Une pièce plus large que le bin ne se placera jamais, quel que soit
         // le nombre de rangées : ouvrir boucherait sans fin. Même marqueur que
@@ -523,14 +533,17 @@ std::vector<Placement> TiledEngine::place(const Bin &bin,
                 // Aucune orientation n'entre : c'est ici, et seulement ici,
                 // qu'une rangée s'ouvre.
                 //
-                // Sauf quand une zone interdite a mangé la place : les rangées ne la
-                // rendront pas, et en ouvrir indéfiniment serait une boucle sans fin.
-                // Même marqueur que la pièce trop large, et pour la même raison —
+                // Sauf quand le plafond est atteint : les rangées ne rendront pas la
+                // place, et en ouvrir indéfiniment serait une boucle sans fin. Même
+                // marqueur que la pièce trop large, et pour la même raison —
                 // `rotation < 0` est ce que la passe 2 et l'hôte lisent — et le plan
                 // entier est rendu tel quel. Ostara le déclarera incomplet par
                 // `AllPlaced` et gardera celui du moteur de bande, qui a déjà posé
                 // toutes les pièces.
-                if (!zones.empty() && rows >= maxRows)
+                // Un plafond calculé peut être inutilisable (NaN dans une hauteur) ; celui-ci est
+                // une constante, et il ne peut pas être neutralisé par une géométrie douteuse.
+                constexpr int64_t kAbsoluteRowLimit = 100000;
+                if (rows >= maxRows || rows >= kAbsoluteRowLimit)
                 {
                     out[pieceIdx].pieceIndex = pieceIdx;
                     out[pieceIdx].rotation   = -1.0;

@@ -105,6 +105,60 @@ inline NFPCacheKey makeNFPCacheKey(int pieceA, int rotA, int pieceB, int rotB) n
          | (std::uint64_t(pieceB) << 16) |  std::uint64_t(rotB);
 }
 
+/// ── L'empreinte de nidification : allégée, jamais rapetissée ────────────────────────────────────
+///
+/// Un contour de couture porte 74 à 283 sommets (mesuré sur l'export réel du patron client) : pour
+/// décider où poser une pièce sur du papier, c'est du luxe inutile — et chaque somme de Minkowski
+/// paie ce luxe au produit des deux nombres de sommets, des milliers de fois par run.
+///
+/// **L'ordre des deux opérations est la garantie.** On GONFLE d'abord du double de la tolérance, on
+/// simplifie ensuite de la tolérance : la polyligne simplifiée passe par des points de la frontière
+/// gonflée, donc elle ne peut pas entrer dans la pièce d'origine. Une empreinte qui rapetisse
+/// rapprocherait deux pièces sous le dégagement — c'est le seul risque de cette passe, et il est
+/// géométriquement exclu.
+///
+/// Ce que l'appelant dessine n'est pas touché : seule l'empreinte que le moteur pose est allégée.
+inline std::vector<Clipper2Lib::Path64>
+simplifyForNesting(const std::vector<Clipper2Lib::Path64> &pieces, int64_t toleranceFixed)
+{
+    std::vector<Clipper2Lib::Path64> out;
+    out.reserve(pieces.size());
+    if (toleranceFixed <= 0)
+    {
+        return pieces;
+    }
+
+    for (const Clipper2Lib::Path64 &piece : pieces)
+    {
+        if (piece.size() < 4)
+        {
+            out.push_back(piece);
+            continue;
+        }
+
+        const Clipper2Lib::Paths64 grown = Clipper2Lib::InflatePaths(
+            {piece}, static_cast<double>(toleranceFixed) * 2.0, Clipper2Lib::JoinType::Miter,
+            Clipper2Lib::EndType::Polygon);
+        if (grown.size() != 1)
+        {
+            out.push_back(piece);
+            continue;
+        }
+
+        Clipper2Lib::Path64 tidy =
+            Clipper2Lib::SimplifyPath(grown.front(), static_cast<double>(toleranceFixed), true);
+        // Un triangle n'est pas un contour : sous ce seuil on garde la pièce telle quelle.
+        if (tidy.size() < 3 || tidy.size() >= piece.size())
+        {
+            out.push_back(piece);
+            continue;
+        }
+        out.push_back(std::move(tidy));
+    }
+
+    return out;
+}
+
 inline BBox bboxFromPath(const Clipper2Lib::Path64 &path)
 {
     BBox b = {(std::numeric_limits<int64_t>::max)(),
