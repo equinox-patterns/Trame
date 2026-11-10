@@ -59,6 +59,32 @@ struct AlphaState
 
 using AlphaStates = QVector<AlphaState>;
 
+/// @brief One image a rendered drawing draws, carried across with its own bytes.
+///
+/// **A picture is not something the copied stream can resolve on its own.** Qt renders a drawing
+/// into a PDF of its own, where an image is an object the content stream calls by name —
+/// `/Im13 Do` — and that name IS the object's number in that file. This module copies the content
+/// stream and nothing else, so the call arrived with no object behind it: a reader ignores a name
+/// it cannot resolve and says nothing, and the picture was simply absent from the plan.
+///
+/// **The name never changes.** A name resolves inside the resources of the form that invokes it,
+/// so two layers may both call `/Im13` and mean two different pictures; only the object number,
+/// new in our own file, differs. That is also why nothing has to be renamed in any stream.
+///
+/// Two references in the image's own dictionary do have to be rewritten, and both are easy to
+/// forget: `/Length`, which Qt always writes as an indirect reference, and the soft mask, whose
+/// object nothing else in the file names — it is reachable from this dictionary alone.
+struct ImageObject
+{
+    QByteArray name;       ///< without the leading slash: `Im13`, the name the stream calls
+    QByteArray dict;       ///< the dictionary, `/Length` still an indirect reference
+    QByteArray stream;     ///< the bytes of the picture, copied as they came
+    QByteArray maskKey;    ///< `/SMask` or `/Mask` — the name the dictionary gave it
+    QByteArray maskDict;   ///< the mask's own dictionary, empty when there is none
+    QByteArray maskStream; ///< and the mask's own bytes
+    int        maskOld = 0; ///< the mask's object number in the rendered file, 0 when none
+};
+
 class SvgToOcgPdf
 {
 public:
@@ -219,6 +245,7 @@ private:
         QByteArray stream;        // decompressed PDF content from QSvgRenderer
         QByteArray textStream;    // text operators (MEP only), separate CTM scope
         bool       plain = false; // the whole document: no layer, so no optional content
+        QVector<ImageObject> images; // the pictures the stream calls, in the order it calls them
     };
 
     /// @brief A second document, drawn on every page under every layer, and never optional.
@@ -236,6 +263,7 @@ private:
     {
         QByteArray stream;     // the shapes, as the renderer drew them
         QByteArray textStream; // the text, re-emitted as path operators, its own CTM
+        QVector<ImageObject> images; // the pictures it draws — a frame's logo among them
 
         bool isEmpty() const { return stream.isEmpty() && textStream.isEmpty(); }
     };
@@ -260,6 +288,7 @@ private:
         PageInfo   page;
         QByteArray stream;     // the shapes, as the renderer drew them
         QByteArray textStream; // the text, re-emitted as path operators, its own CTM
+        QVector<ImageObject> images; // the pictures it draws — the nomenclature's logo
 
         bool isEmpty() const { return stream.isEmpty() && textStream.isEmpty(); }
     };

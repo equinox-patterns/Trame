@@ -365,6 +365,10 @@ namespace
 /// readSvg comes first in this file and is one of the two callers: the alpha states have to be
 /// lifted out of the buffer while it is still alive, and that is inside readSvg, not after it.
 void CollectAlphaStates(const QByteArray &pdfBuf, const QByteArray &stream, AlphaStates &into);
+
+/// Declared for the same reason, and at the same place: a picture has to be lifted out of the
+/// rendered document while it is still alive, and that happens inside readSvg.
+void CollectImages(const QByteArray &pdfBuf, const QByteArray &stream, QVector<ImageObject> &into);
 }  // namespace
 
 SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
@@ -446,6 +450,9 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
         whole.name = QStringLiteral("Document");
         whole.stream = stream;
         whole.plain = true;
+        // The pictures the drawing holds — taken here, because the rendered document does not
+        // outlive this function and the writer needs their bytes long after.
+        CollectImages(pdfBuf, stream, whole.images);
         // The words, redrawn from their outlines — and outside every optional content group, since
         // a document with no layer has nothing to switch off.
         whole.textStream = emitMepTextAsPdfOps(doc.documentElement(), result.page,
@@ -487,8 +494,15 @@ SvgToOcgPdf::SvgContent SvgToOcgPdf::readSvg(const QString &svgPath,
             textStream = emitMepTextAsPdfOps(layer.element, result.page, result.alphaStates);
         }
 
-        result.layers.append(
-            {layer.name, layer.displayName, layer.isMep, layer.role, stream, textStream});
+        LayerContent content;
+        content.name = layer.name;
+        content.displayName = layer.displayName;
+        content.isMep = layer.isMep;
+        content.role = layer.role;
+        content.stream = stream;
+        content.textStream = textStream;
+        CollectImages(pdfBuf, stream, content.images);
+        result.layers.append(content);
     }
 
     if (result.layers.isEmpty()) {
@@ -745,6 +759,7 @@ bool SvgToOcgPdf::readUnderlay(const QString &svgPath, const PageInfo &plan,
     // renderer cannot draw it into a form that carries no font, so it is re-emitted here as
     // path operators, in a scope of its own.
     CollectAlphaStates(pdfBuf, out.stream, alpha);
+    CollectImages(pdfBuf, out.stream, out.images);
 
     out.textStream = emitMepTextAsPdfOps(doc.documentElement(), plan, alpha);
     return true;
@@ -792,6 +807,7 @@ bool SvgToOcgPdf::readCover(const QString &svgPath, Cover &out, AlphaStates &alp
     }
 
     CollectAlphaStates(pdfBuf, out.stream, alpha);
+    CollectImages(pdfBuf, out.stream, out.images);
 
     // The page goes with it, and not merely its height: this document's viewBox does not begin at
     // the origin, and the re-emission reads both axes off the page it is given.
@@ -976,6 +992,185 @@ auto ExtractObjectBody(const QByteArray &pdfBuf, int num) -> QByteArray
             return {};
 
         return pdfBuf.mid(cursor, end - cursor);
+    }
+}
+
+/// @brief The image objects @p stream draws, in the order it first draws them.
+///
+/// **The name Qt gives an image is its object number.** `/Im13 Do` calls object 13, so the stream
+/// says where every picture lies without the source document's /Resources dictionary being read at
+/// all — the same shortcut the alpha states take, and for the same reason: the dictionary is an
+/// indirection the stream has already resolved.
+///
+/// The `Do` that must follow is what tells a call from a mention. `/Im13` also appears as a key of
+/// that dictionary, and a name that is only declared is not a picture to be carried.
+auto ReferencedImageNames(const QByteArray &stream) -> QVector<int>
+{
+    QVector<int> numbers;
+    int at = 0;
+    while ((at = stream.indexOf("/Im", at)) >= 0) {
+        int cursor = at + 3;
+        int number = 0;
+        while (cursor < stream.size() && stream[cursor] >= '0' && stream[cursor] <= '9') {
+            number = number * 10 + (stream[cursor] - '0');
+            ++cursor;
+        }
+        int probe = cursor;
+        while (probe < stream.size() && (stream[probe] == ' ' || stream[probe] == '\n'))
+            ++probe;
+        if (number > 0 && probe + 1 < stream.size() && stream[probe] == 'D'
+            && stream[probe + 1] == 'o' && !numbers.contains(number)) {
+            numbers.append(number);
+        }
+        at = cursor;
+    }
+    return numbers;
+}
+
+/// @brief The object number @p key names in @p dict, or 0 when it names none.
+///
+/// `/None` and `/Identity` are names, not numbers, and answer nought: an image that carries no
+/// soft mask must not be given one.
+auto DictNumber(const QByteArray &dict, const QByteArray &key) -> int
+{
+    const int at = dict.indexOf(key);
+    if (at < 0)
+        return 0;
+
+    int cursor = at + static_cast<int>(key.size());
+    while (cursor < dict.size()
+           && (dict[cursor] == ' ' || dict[cursor] == '\n' || dict[cursor] == '\r')) {
+        ++cursor;
+    }
+
+    int number = 0;
+    bool digits = false;
+    while (cursor < dict.size() && dict[cursor] >= '0' && dict[cursor] <= '9') {
+        number = number * 10 + (dict[cursor] - '0');
+        ++cursor;
+        digits = true;
+    }
+    return digits ? number : 0;
+}
+
+/// @brief Make @p key name @p number in @p dict — as an indirect reference, or as a plain number.
+///
+/// Two references have to be moved when an object is copied into this file, and neither moves by
+/// itself: `/Length`, which Qt always writes indirect, and the mask, whose object nothing but this
+/// dictionary names. The bytes of a picture are copied as they came, so the value of `/Length` is
+/// the size of what was copied — exact, never guessed.
+///
+/// **The two are spelled differently and must not be confused.** `/Length` becomes a plain number;
+/// the mask names an OBJECT, and `5` there reads as the number five — the file is then wrong in a
+/// way no reader reports, and the picture arrives without its transparency.
+void SetDictNumber(QByteArray &dict, const QByteArray &key, int number, bool asReference)
+{
+    const int at = dict.indexOf(key);
+    if (at < 0)
+        return;
+
+    int cursor = at + static_cast<int>(key.size());
+    while (cursor < dict.size()
+           && (dict[cursor] == ' ' || dict[cursor] == '\n' || dict[cursor] == '\r')) {
+        ++cursor;
+    }
+
+    const int from = cursor;
+    while (cursor < dict.size() && dict[cursor] >= '0' && dict[cursor] <= '9')
+        ++cursor;
+    if (cursor == from)
+        return;
+
+    // An indirect reference spells `45 0 R`; a plain number spells itself and the `>>` follows.
+    int after = cursor;
+    while (after < dict.size()
+           && (dict[after] == ' ' || dict[after] == '\n' || dict[after] == '\r')) {
+        ++after;
+    }
+    if (after < dict.size() && dict[after] == '0') {
+        int end = after + 1;
+        while (end < dict.size() && dict[end] == ' ')
+            ++end;
+        if (end < dict.size() && dict[end] == 'R')
+            cursor = end + 1;
+    }
+
+    dict.replace(from, cursor - from,
+                 asReference ? QByteArray::number(number) + " 0 R" : QByteArray::number(number));
+}
+
+/// @brief Object @p num cut in two: its dictionary, and the bytes of its stream.
+auto SplitStreamObject(const QByteArray &pdfBuf, int num, QByteArray &dict, QByteArray &stream)
+    -> bool
+{
+    const QByteArray body = ExtractObjectBody(pdfBuf, num);
+    if (body.isEmpty())
+        return false;
+
+    const int streamAt = body.indexOf("stream");
+    if (streamAt < 0)
+        return false;
+
+    dict = body.left(streamAt);
+
+    int start = streamAt + 6; // past "stream"
+    if (start < body.size() && body[start] == '\r')
+        ++start;
+    if (start < body.size() && body[start] == '\n')
+        ++start;
+
+    // The dictionary says how long the stream is, and says it as a reference: taken at its word,
+    // as extractContentStream does, rather than guessed from where `endstream` sits. Those bytes
+    // are a picture, and a picture is as likely as anything to contain that word.
+    const int length = DeclaredStreamLength(pdfBuf, dict);
+    if (length <= 0 || start + length > body.size())
+        return false;
+
+    stream = body.mid(start, length);
+    return true;
+}
+
+/// @brief Adds every image @p stream draws, bytes and all, while @p pdfBuf is still alive.
+///
+/// The same contract as CollectAlphaStates, and for the same reason: the rendered document does
+/// not outlive the function that read it, and the writer needs these bytes long after.
+void CollectImages(const QByteArray &pdfBuf, const QByteArray &stream, QVector<ImageObject> &into)
+{
+    for (int num : ReferencedImageNames(stream)) {
+        const QByteArray name = "Im" + QByteArray::number(num);
+
+        bool known = false;
+        for (const ImageObject &image : into) {
+            if (image.name == name)
+                known = true;
+        }
+        if (known)
+            continue;
+
+        ImageObject image;
+        image.name = name;
+        if (!SplitStreamObject(pdfBuf, num, image.dict, image.stream)) {
+            qWarning() << "SvgToOcgPdf: image object" << num
+                       << "is not in the rendered document";
+            continue;
+        }
+
+        // A soft mask is an object of its own, and nothing in the stream names it — only this
+        // dictionary does. Left behind, the picture arrives opaque where it had transparency.
+        image.maskKey = "/SMask";
+        image.maskOld = DictNumber(image.dict, image.maskKey);
+        if (image.maskOld <= 0) {
+            image.maskKey = "/Mask"; // the stencil form
+            image.maskOld = DictNumber(image.dict, image.maskKey);
+        }
+        if (image.maskOld > 0
+            && !SplitStreamObject(pdfBuf, image.maskOld, image.maskDict, image.maskStream)) {
+            qWarning() << "SvgToOcgPdf: the mask of image object" << num
+                       << "is not in the rendered document";
+            image.maskOld = 0;
+        }
+
+        into.append(image);
     }
 }
 
@@ -1826,7 +2021,40 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
     // the file a single time. It is also RENDERED a single time, and that is the other half
     // of the win — a document read once is M renders, where a page read its own copy was
     // N×M of them.
-    const auto makeForm = [&](const QByteArray &content) {
+    const auto makeForm = [&](const QByteArray &content, const QVector<ImageObject> &images) {
+        // **The pictures are declared here, in the form that draws them.** A name in a PDF resolves
+        // inside the /Resources of the XObject whose stream calls it, and a form's /Resources
+        // REPLACES the page's rather than adding to it. Declaring an image on the page is the
+        // mistake that looks like « still no logo »: nothing reports it, the `Do` is ignored, and
+        // the drawing comes out without the picture it was made of.
+        //
+        // **The names are kept; the numbers are new.** Two layers may both call `/Im13` and mean
+        // two different pictures — a name resolves per form, so each form declares its own and no
+        // stream has to be rewritten at all.
+        QByteArray pictureEntries;
+        for (const ImageObject &image : images) {
+            // The mask first: it is an object of its own and the image's dictionary names it.
+            int maskNum = 0;
+            if (image.maskOld > 0) {
+                QByteArray maskDict = image.maskDict;
+                SetDictNumber(maskDict, "/Length", image.maskStream.size(), false);
+                maskNum = addObject(maskDict + "stream\n" + image.maskStream + "\nendstream");
+            }
+
+            QByteArray dict = image.dict;
+            SetDictNumber(dict, "/Length", image.stream.size(), false);
+            if (maskNum > 0)
+                SetDictNumber(dict, image.maskKey, maskNum, true);
+            const int imageNum = addObject(dict + "stream\n" + image.stream + "\nendstream");
+
+            pictureEntries.append("         /" + image.name + " " + QByteArray::number(imageNum)
+                                  + " 0 R\n");
+        }
+
+        QByteArray xobjectBlock;
+        if (!pictureEntries.isEmpty())
+            xobjectBlock = "      /XObject <<\n" + pictureEntries + "      >>\n";
+
         return addObject(
             QStringLiteral(
                 "<< /Type /XObject /Subtype /Form\n"
@@ -1834,11 +2062,12 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
                 "   /Resources <<\n"
                 "      /ExtGState << %2 >>\n"
                 "      /ColorSpace << /CSp /DeviceRGB >>\n"
+                "%4"
                 "   >>\n"
                 "   /Length %3 >>\n"
                 "stream\n"
             ).arg(QString::fromUtf8(bbox)).arg(QString::fromUtf8(extGStates))
-             .arg(content.size()).toUtf8()
+             .arg(content.size()).arg(QString::fromUtf8(xobjectBlock)).toUtf8()
             + content
             + "\nendstream");
     };
@@ -1868,7 +2097,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
             content.append(layer->stream);
         }
 
-        formObjs.append(makeForm(content));
+        formObjs.append(makeForm(content, layer->images));
     }
 
     // The underlay comes last among the forms and first in every page. It is written and
@@ -1889,7 +2118,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         }
 
         underlayFormIndex = formObjs.size();
-        formObjs.append(makeForm(content));
+        formObjs.append(makeForm(content, doc.underlay.images));
     }
 
     // The cover page's document, written like the underlay's and invoked like it on every page —
@@ -1908,7 +2137,7 @@ bool SvgToOcgPdf::buildOcgPdf(const QString         &pdfPath,
         }
 
         coverFormIndex = formObjs.size();
-        formObjs.append(makeForm(content));
+        formObjs.append(makeForm(content, doc.cover.images));
     }
 
     QVector<int> pageObjs;
